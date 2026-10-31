@@ -1,0 +1,2283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Firstmark Prototype</title>
+<!--
+  FIRSTMARK — clickable scope/behaviour prototype for a provenance-first game discovery site.
+
+  File layout (edit by hand):
+    1. MOCK DATA     <script id="mock-data">   — settings defaults, games, similarity pairs, claims, appeals,
+                                                 scripted moderator decisions, expected statuses per test case.
+    2. RULES ENGINE  <script id="rules-engine"> — pure functions, no DOM. Routes every game to exactly one status.
+    3. UI            <script type="text/babel">  — React views (store, game page, registration, claims,
+                                                 moderation, settings, simulation, tests).
+
+  Everything is mocked. No network calls except loading React / Babel / Tailwind from CDNs.
+-->
+<script src="https://cdn.tailwindcss.com/3.4.5"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          steam: {
+            bg: '#1b2838', deep: '#171a21', panel: '#16202d', card: '#213246',
+            line: '#2a3f5a', text: '#c7d5e0', dim: '#8f98a0', accent: '#66c0f4', green: '#a4d007',
+          },
+        },
+      },
+    },
+  };
+</script>
+<style>
+  body { background: #1b2838; color: #c7d5e0; font-family: "Motiva Sans", Arial, Helvetica, sans-serif; }
+  input, select, textarea { background: #0e1621; border: 1px solid #2a3f5a; color: #c7d5e0; border-radius: 3px; padding: 4px 8px; }
+  input[type=checkbox], input[type=range] { padding: 0; }
+  input[type=range] { accent-color: #66c0f4; }
+  .flash { animation: flash 1.6s ease-out 1; }
+  @keyframes flash { 0% { box-shadow: 0 0 0 3px #f59e0b; } 100% { box-shadow: 0 0 0 0 transparent; } }
+</style>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+</head>
+<body>
+<div id="root"><p style="padding:24px">Loading prototype…</p></div>
+
+<!-- ======================================================================================
+     1. MOCK DATA
+     ======================================================================================
+  Conventions
+  - Dates are 'YYYY-MM-DD' strings. The simulation runs from simulation.start to simulation.end.
+  - A game "enters the system" on the earlier of its Steam page date (auto-import) or its registration date.
+  - reviews:    number, or [[date, count], ...] (linearly interpolated, 0 before the first point).
+  - copySignal: number, or [[date, score], ...] (step function). Share of reviews that claim the game
+                reproduces a SPECIFIC other game. Genre comparisons ("like Hades") are tracked separately
+                in genreSignal and never count.
+  - namesOriginal: copy-signal reviews on THIS game's page that name another game as the original.
+  - ai: only list categories that are not 'none'. Levels: 'assisted' (human-edited) | 'generated'.
+  - truth: ground truth for the test panel only, never shown publicly.
+           'original' | 'non-original' | 'parallel' | 'idea-overlap' | 'n/a'.
+           A 'non-original' that ends up LISTED or VERIFIED is flagged as a worst-case error.
+  - expected: [[fromDate, STATUS], ...] step function. Before the first entry the game is expected
+              to be unknown to the system (null). Statuses: LISTED, VERIFIED, NOT_YET_ELIGIBLE, HELD,
+              QUEUED, REJECTED, ATTACHED (DLC attached to its parent; see ambiguity notes).
+  - All names, studios, people, and URLs are fictional. Links use *.example domains or fake app ids.
+-->
+<script id="mock-data">
+const MOCK_DATA = {
+  simulation: { start: '2026-09-01', end: '2027-02-28', defaultDate: '2026-10-27' },
+
+  // ---- Rules-engine thresholds (all editable live in the Settings panel) -------------------
+  settings: {
+    MIN_DAYS_RELEASED: 30,
+    MIN_REVIEWS: 50,
+    COPY_SIGNAL_THRESHOLD: 0.3,
+    SIMILARITY_THRESHOLD: 0.75,
+    NAMED_AS_ORIGINAL_CHECK: true,          // "not named as the original in copy reviews on another game's page"
+    CLAIM_REQUIRES_DISTINCTIVE_OVERLAP: true,
+    PRIORITY_ASSET_MATCH: 100,
+    PRIORITY_PRERELEASE_REGISTRATION: 90,
+    PRIORITY_CLAIM: 70,
+    PRIORITY_APPEAL: 60,
+    PRIORITY_REGISTRATION: 50,
+    PRIORITY_BOOST_LIVE_LOOKALIKE: 5,       // registration whose look-alike is already live on Steam
+    WEEKLY_CAPACITY: 25,
+    RESPONSE_WINDOW_DAYS: 14,
+  },
+
+  aiCategories: [
+    { key: 'art', label: 'Art & visuals' },
+    { key: 'music', label: 'Music' },
+    { key: 'sfx', label: 'Sound effects' },
+    { key: 'voice', label: 'Voice' },
+    { key: 'writing', label: 'Writing & narrative' },
+    { key: 'design', label: 'Game design & mechanics' },
+    { key: 'code', label: 'Code' },
+    { key: 'translation', label: 'Translation' },
+    { key: 'runtime', label: 'Live / runtime generation' },
+    { key: 'marketing', label: 'Marketing materials' },
+  ],
+
+  // ---- Games ----------------------------------------------------------------------------------
+  games: [
+    // CASE 1 — established genuine indie original, many reviews, no signals → LISTED
+    {
+      id: 'ember-hollow', case: '1', scenario: 'Established independent original, no signals',
+      title: 'Ember Hollow', studio: 'Lantern Moth Games', kind: 'game',
+      tags: ['Metroidvania', 'Action', 'Hand-drawn', 'Atmospheric'], colors: ['#7c2d12', '#f59e0b'],
+      desc: 'Descend through a smouldering hollow beneath a sleeping volcano, relighting forgotten shrines with a lantern that remembers every flame it has carried.',
+      links: { steam: 'https://store.steampowered.com/app/9100101/', dev: 'https://lanternmoth.example/ember-hollow' },
+      dates: { firstPublicRecord: '2024-02-10', steamPageCreated: '2024-09-01', release: '2025-03-14' },
+      publicRecords: [{ date: '2024-02-10', label: 'Reveal trailer published', url: 'https://video.example/watch?v=eh-reveal' }],
+      reviews: [['2026-09-01', 4200], ['2027-02-28', 4700]], positivePct: 94, copySignal: 0.01, genreSignal: 0.12,
+      reviewSamples: [
+        { author: 'mossbyte_rae', text: 'The lantern mechanic is the best idea I’ve seen in a metroidvania in years.', signal: 'none' },
+        { author: 'Tobiah K.', text: 'Gorgeous, tough, fair. 31 hours and I want more.', signal: 'none' },
+      ],
+      ai: {}, aiSource: 'developer', aiQuote: 'No generative AI tools were used in making Ember Hollow.',
+      truth: 'original', expected: [['2026-09-01', 'LISTED']],
+    },
+    // CASE 16a — soundtrack → REJECTED (not a game)
+    {
+      id: 'ember-hollow-ost', case: '16a', scenario: 'Soundtrack listing (not a game)',
+      title: 'Ember Hollow — Original Soundtrack', studio: 'Lantern Moth Games', kind: 'soundtrack', parentId: 'ember-hollow',
+      tags: ['Soundtrack'], colors: ['#431407', '#fb923c'], desc: '42 tracks by Ines Varga.',
+      links: { steam: 'https://store.steampowered.com/app/9100102/' },
+      dates: { steamPageCreated: '2025-03-14', release: '2025-03-14' }, reviews: 120, positivePct: 98, copySignal: 0,
+      ai: {}, aiSource: 'developer', aiQuote: 'No AI used.', truth: 'n/a', expected: [['2026-09-01', 'REJECTED']],
+    },
+    // CASE 16b — DLC → attaches to parent instead of being evaluated on its own
+    {
+      id: 'ember-hollow-choir', case: '16b', scenario: 'DLC (attaches to its parent game)',
+      title: 'Ember Hollow: The Sunken Choir', studio: 'Lantern Moth Games', kind: 'dlc', parentId: 'ember-hollow',
+      tags: ['DLC'], colors: ['#1e3a8a', '#f59e0b'], desc: 'A flooded cathedral region with six new shrines.',
+      links: { steam: 'https://store.steampowered.com/app/9100103/' },
+      dates: { steamPageCreated: '2026-05-01', release: '2026-06-01' }, reviews: 310, positivePct: 91, copySignal: 0,
+      ai: {}, aiSource: 'developer', aiQuote: 'No AI used.', truth: 'n/a', expected: [['2026-09-01', 'ATTACHED']],
+    },
+
+    // CASE 2 — same kind of original, developer claims it and passes review → VERIFIED
+    {
+      id: 'tidewright', case: '2', scenario: 'Original claimed by its developer, passes moderator review',
+      title: 'Tidewright', studio: 'Saltglass Studio', kind: 'game',
+      tags: ['Roguelite', 'Sailing', 'Crafting'], colors: ['#0c4a6e', '#22d3ee'],
+      desc: 'Build a ship plank by plank from what the tide gives you. Every run, the sea rearranges itself.',
+      links: { steam: 'https://store.steampowered.com/app/9100201/', dev: 'https://saltglass.example/tidewright' },
+      dates: { firstPublicRecord: '2024-12-01', steamPageCreated: '2025-05-14', release: '2025-11-02' },
+      publicRecords: [{ date: '2024-12-01', label: 'Devlog #1: “Building a boat out of driftwood”', url: 'https://saltglass.example/devlog/1' }],
+      reviews: [['2026-09-01', 1800], ['2027-02-28', 2100]], positivePct: 89, copySignal: 0.02, genreSignal: 0.2,
+      reviewSamples: [
+        { author: 'halyard', text: 'Like a cozier FTL on the open sea. The hull-patching is so satisfying.', signal: 'genre' },
+        { author: 'Pell Ostrander', text: 'My favourite roguelite of the year.', signal: 'none' },
+      ],
+      registration: {
+        filed: '2026-10-01', by: 'Noor Salgado (Saltglass Studio)',
+        evidence: [
+          { type: 'git', date: '2023-02-10', label: 'Repository history, first commit', value: 'git:7c1e9a0', verifiable: false },
+          { type: 'devlog', date: '2024-12-01', label: 'Devlog #1', value: 'https://saltglass.example/devlog/1', verifiable: true },
+          { type: 'build_hash', date: '2025-11-02', label: 'Release build v1.0.0', value: 'sha256:3b8f…c201', verifiable: true },
+        ],
+      },
+      ai: { code: 'assisted', translation: 'assisted' }, aiSource: 'developer',
+      aiQuote: 'We used an AI coding assistant for boilerplate (every change reviewed by our programmers) and machine translation as a first pass that human translators edited.',
+      truth: 'original', expected: [['2026-09-01', 'LISTED'], ['2026-10-01', 'QUEUED'], ['2026-10-14', 'VERIFIED']],
+    },
+
+    // CASE 3 — released original, later reproduced by a look-alike
+    {
+      id: 'paper-orchard', case: '3a', scenario: 'Released original; a look-alike launched later',
+      title: 'Paper Orchard', studio: 'Two Wrens Interactive', kind: 'game',
+      tags: ['Puzzle', 'Relaxing', 'Origami'], colors: ['#14532d', '#fde68a'],
+      desc: 'Fold paper trees until they bear fruit. 140 hand-made folding puzzles and no timers, ever.',
+      links: { steam: 'https://store.steampowered.com/app/9100301/', dev: 'https://twowrens.example' },
+      dates: { firstPublicRecord: '2024-08-15', steamPageCreated: '2025-01-08', release: '2025-06-20' },
+      publicRecords: [{ date: '2024-08-15', label: 'Playable demo shown at Northside Indie Fest', url: 'https://northsidefest.example/2024/paper-orchard' }],
+      reviews: [['2026-09-01', 5100], ['2027-02-28', 5600]], positivePct: 96, copySignal: 0.0, genreSignal: 0.05,
+      reviewSamples: [
+        { author: 'quietfold', text: 'The crease-preview mechanic is genius. I play a puzzle every night before bed.', signal: 'none' },
+        { author: 'Marguerite L.', text: 'Pure, calm, clever.', signal: 'none' },
+      ],
+      registration: {
+        filed: '2026-07-02', by: 'Ada Wren (Two Wrens Interactive)',
+        evidence: [
+          { type: 'git', date: '2023-11-20', label: 'Repository history, first commit', value: 'git:a91f003', verifiable: false },
+          { type: 'build_hash', date: '2024-08-14', label: 'Festival demo build', value: 'sha256:51d0…8e4a', verifiable: true },
+        ],
+      },
+      ai: {}, aiSource: 'developer', aiQuote: 'Paper Orchard was made without any AI tools.',
+      truth: 'original', expected: [['2026-09-01', 'VERIFIED']],
+    },
+    {
+      id: 'origami-grove', case: '3b', scenario: 'Later look-alike of #3a',
+      title: 'Origami Grove: Fold Puzzle', studio: 'Brightpeak Apps Ltd', kind: 'game',
+      tags: ['Puzzle', 'Casual', 'Origami'], colors: ['#166534', '#fef08a'],
+      desc: 'Fold paper trees and collect fruit in 200 relaxing folding puzzles!',
+      links: { steam: 'https://store.steampowered.com/app/9100302/' },
+      dates: { firstPublicRecord: '2026-08-03', steamPageCreated: '2026-08-03', release: '2026-08-28' },
+      reviews: [['2026-08-28', 0], ['2026-09-15', 180], ['2026-10-27', 400], ['2026-12-31', 520]], positivePct: 61,
+      copySignal: [['2026-08-28', 0.2], ['2026-09-05', 0.46]], genreSignal: 0.1,
+      namesOriginal: [{ id: 'paper-orchard', from: '2026-09-05' }],
+      reviewSamples: [
+        { author: 'quietfold', text: 'This is Paper Orchard with the serial numbers filed off. Same crease preview, same orchard map.', signal: 'copy' },
+        { author: 'jun_plays', text: 'Fine time-killer.', signal: 'none' },
+      ],
+      ai: { art: 'generated', writing: 'generated', marketing: 'generated', code: 'assisted' }, aiSource: 'steam',
+      aiQuote: 'From the Steam page AI disclosure: “Some art and store text were created with AI tools.”',
+      truth: 'non-original', expected: [['2026-09-01', 'HELD']],
+    },
+
+    // CASE 4 — unreleased original shown only in a social teaser; look-alike launched on Steam first
+    {
+      id: 'lumen-moss', case: '4a', scenario: 'Unreleased original shown only in a social teaser; pre-registered',
+      title: 'Lumen & Moss', studio: 'Fernhill Collective', kind: 'game',
+      tags: ['Exploration', 'Bioluminescent', 'Cozy'], colors: ['#064e3b', '#a3e635'],
+      desc: 'Tend a glowing moss that lights your way through a cave that grows while you sleep.',
+      links: { dev: 'https://fernhill.example/lumen-and-moss' },
+      dates: { firstPublicRecord: '2026-06-18', steamPageCreated: null, release: null },
+      publicRecords: [{ date: '2026-06-18', label: 'Gameplay teaser posted on social media', url: 'https://social.example/fernhill/status/55120' }],
+      reviews: 0, copySignal: 0,
+      registration: {
+        filed: '2026-09-20', by: 'Ozzie Fernhill (Fernhill Collective)',
+        evidence: [
+          { type: 'git', date: '2025-11-04', label: 'Repository history, first commit', value: 'git:00fe12b', verifiable: false },
+          { type: 'concept_art', date: '2026-04-02', label: 'Moss-growth concept sheet', value: 'sha256:aa71…09d3', verifiable: false },
+          { type: 'teaser', date: '2026-06-18', label: 'Social teaser', value: 'https://social.example/fernhill/status/55120', verifiable: true },
+          { type: 'build_hash', date: '2026-09-18', label: 'Vertical-slice build', value: 'sha256:e403…7b21', verifiable: false },
+        ],
+      },
+      ai: { sfx: 'assisted' }, aiSource: 'developer', aiQuote: 'A few ambient sound layers were generated, then edited and mixed by our sound designer.',
+      truth: 'original', expected: [['2026-09-20', 'QUEUED']],
+    },
+    {
+      id: 'glowmoss', case: '4b', scenario: 'Look-alike of #4a’s teaser that launched on Steam first',
+      title: 'Glowmoss Wanderer', studio: 'Quickforge Games', kind: 'game',
+      tags: ['Exploration', 'Cozy', 'Survival'], colors: ['#065f46', '#bef264'],
+      desc: 'Grow glowing moss to light your path through an ever-growing cave!',
+      links: { steam: 'https://store.steampowered.com/app/9100402/' },
+      dates: { firstPublicRecord: '2026-08-12', steamPageCreated: '2026-08-12', release: '2026-09-15' },
+      reviews: [['2026-09-15', 0], ['2026-10-27', 260], ['2026-12-31', 600]], positivePct: 78, copySignal: 0.08, genreSignal: 0.15,
+      reviewSamples: [
+        { author: 'lichen_lord', text: 'Chill cave game, nice glow effects.', signal: 'none' },
+        { author: 'spelunkr', text: 'Reminds me of a teaser I saw months ago?', signal: 'none' },
+      ],
+      ai: { art: 'generated', voice: 'generated', marketing: 'generated' }, aiSource: 'steam',
+      aiQuote: 'From the Steam page AI disclosure: “AI was used to generate artwork, character voices and promotional material.”',
+      truth: 'non-original', expected: [['2026-09-01', 'NOT_YET_ELIGIBLE'], ['2026-09-20', 'HELD']],
+    },
+
+    // CASE 5 — built from a publicly shown idea (no code reuse); strong-evidence user claim → QUEUED
+    {
+      id: 'cinder-courier', case: '5', scenario: 'Game facing a strong-evidence idea claim (no code reuse)',
+      title: 'Cinder Courier', studio: 'Northvale Interactive', kind: 'game',
+      tags: ['Action', 'Delivery', 'Roguelite'], colors: ['#7f1d1d', '#fdba74'],
+      desc: 'Deliver letters across a burning city. Your cart runs on the mail you carry.',
+      links: { steam: 'https://store.steampowered.com/app/9100501/', dev: 'https://northvale.example' },
+      dates: { firstPublicRecord: '2026-08-20', steamPageCreated: '2026-08-20', release: '2026-09-10' },
+      reviews: [['2026-09-10', 0], ['2026-10-27', 340], ['2026-12-31', 700]], positivePct: 83, copySignal: 0.04, genreSignal: 0.1,
+      reviewSamples: [
+        { author: 'brannigan', text: 'Burning letters for fuel is a wild hook. Runs are tense.', signal: 'none' },
+        { author: 'Sol P.', text: 'Short but sweet.', signal: 'none' },
+      ],
+      ai: { writing: 'assisted', marketing: 'assisted' }, aiSource: 'steam',
+      aiQuote: 'From the Steam page AI disclosure: “AI tools helped draft some dialogue and store copy; all text was rewritten by our writers.”',
+      truth: 'idea-overlap',
+      expected: [['2026-09-01', 'NOT_YET_ELIGIBLE'], ['2026-10-10', 'LISTED'], ['2026-10-18', 'QUEUED'], ['2026-11-20', 'LISTED']],
+    },
+
+    // CASE 6 — decompiled code/assets matching a registered build → QUEUED (highest priority)
+    {
+      id: 'thornwake', case: '6a', scenario: 'Registered original whose build was later matched',
+      title: 'Thornwake', studio: 'Kettle & Crow', kind: 'game',
+      tags: ['Action RPG', 'Dark Fantasy', 'Souls-like'], colors: ['#1c1917', '#84cc16'],
+      desc: 'A knight grown from bramble hunts the gardener who planted her.',
+      links: { steam: 'https://store.steampowered.com/app/9100601/', dev: 'https://kettleandcrow.example' },
+      dates: { firstPublicRecord: '2025-06-01', steamPageCreated: '2025-09-10', release: '2026-04-15' },
+      publicRecords: [{ date: '2025-06-01', label: 'Devlog: “Growing a knight out of thorns”', url: 'https://kettleandcrow.example/devlog/1' }],
+      reviews: [['2026-09-01', 2600], ['2027-02-28', 3000]], positivePct: 90, copySignal: 0.03, genreSignal: 0.35,
+      reviewSamples: [{ author: 'graywarden', text: 'Like a souls-like but the boss is your own garden. Brutal and beautiful.', signal: 'genre' }],
+      registration: {
+        filed: '2026-03-01', by: 'Maeve Kettle (Kettle & Crow)',
+        evidence: [
+          { type: 'build_hash', date: '2026-02-27', label: 'Gold master build (IL + asset bundle hashes)', value: 'sha256:0c4e…f5a8', verifiable: false },
+          { type: 'devlog', date: '2025-06-01', label: 'First devlog', value: 'https://kettleandcrow.example/devlog/1', verifiable: true },
+        ],
+      },
+      ai: { translation: 'assisted' }, aiSource: 'developer', aiQuote: 'Machine translation was used as a starting point for our six localisations, then fully edited.',
+      truth: 'original', expected: [['2026-09-01', 'VERIFIED']],
+    },
+    {
+      id: 'bastion-of-thorns', case: '6b', scenario: 'Decompiled code/assets match a registered build',
+      title: 'Bastion of Thorns', studio: 'Grayline Digital', kind: 'game',
+      tags: ['Action RPG', 'Dark Fantasy'], colors: ['#292524', '#65a30d'],
+      desc: 'Become the thorn knight and defeat the gardener in this dark action RPG.',
+      links: { steam: 'https://store.steampowered.com/app/9100602/' },
+      dates: { firstPublicRecord: '2026-09-02', steamPageCreated: '2026-09-02', release: '2026-10-05' },
+      reviews: [['2026-10-05', 0], ['2026-10-27', 90], ['2026-12-31', 240]], positivePct: 55,
+      copySignal: [['2026-10-05', 0], ['2026-10-12', 0.22]], genreSignal: 0.2,
+      namesOriginal: [{ id: 'thornwake', from: '2026-10-12' }],
+      reviewSamples: [{ author: 'graywarden', text: 'This is literally Thornwake’s first area, down to the fog shader.', signal: 'copy' }],
+      assetMatch: {
+        against: 'thornwake', detected: '2026-10-08', score: 0.97, sharedPack: null,
+        details: [
+          'Decompiled IL: 412 of 430 method bodies identical after symbol renaming',
+          'Sprite atlas thorn_tiles.png byte-identical to registered asset bundle',
+          'Custom shader “ThornwakeFog” present under a renamed path',
+        ],
+      },
+      ai: { code: 'generated', art: 'assisted' }, aiSource: 'steam',
+      aiQuote: 'From the Steam page AI disclosure: “Our code was developed with AI and some art was AI-enhanced.”',
+      truth: 'non-original', expected: [['2026-09-02', 'HELD'], ['2026-10-08', 'QUEUED']],
+    },
+
+    // CASE 7 — unreleased, pre-registered original, no look-alikes → QUEUED (pre-release registration)
+    {
+      id: 'starling-archive', case: '7', scenario: 'Unreleased pre-registered original, no look-alikes',
+      title: 'Starling Archive', studio: 'Quiet Harbor Games', kind: 'game',
+      tags: ['Narrative', 'Mystery', 'Point & Click'], colors: ['#312e81', '#c4b5fd'],
+      desc: 'Catalogue the letters of a lighthouse keeper who wrote to birds.',
+      links: { dev: 'https://quietharbor.example/starling' },
+      dates: { firstPublicRecord: '2026-04-22', steamPageCreated: null, release: null },
+      publicRecords: [{ date: '2026-04-22', label: 'Announcement trailer', url: 'https://video.example/watch?v=starling-ann' }],
+      reviews: 0, copySignal: 0,
+      registration: {
+        filed: '2026-09-25', by: 'Wren Aldous (Quiet Harbor Games)',
+        evidence: [
+          { type: 'teaser', date: '2026-04-22', label: 'Announcement trailer', value: 'https://video.example/watch?v=starling-ann', verifiable: true },
+          { type: 'git', date: '2025-01-15', label: 'Repository history, first commit', value: 'git:5e02bb1', verifiable: false },
+        ],
+      },
+      ai: { writing: 'assisted', translation: 'generated' }, aiSource: 'developer',
+      aiQuote: 'We use a grammar assistant on our scripts, and plan to ship AI-translated text for 4 languages (labelled in-game).',
+      truth: 'original', expected: [['2026-09-25', 'QUEUED']],
+    },
+
+    // CASE 8 — ambiguous parallel development (same game-jam theme) → both HELD
+    {
+      id: 'last-lamp', case: '8a', scenario: 'Parallel development from the same game-jam theme',
+      title: 'Last Lamp', studio: 'Pocket Comet', kind: 'game',
+      tags: ['Horror', 'Puzzle', 'Short'], colors: ['#18181b', '#fde047'],
+      desc: 'One lamp. Twelve rooms. Every room you light goes dark behind you.',
+      links: { steam: 'https://store.steampowered.com/app/9100801/', dev: 'https://pocketcomet.example' },
+      dates: { firstPublicRecord: '2026-02-14', steamPageCreated: '2026-04-01', release: '2026-06-10' },
+      publicRecords: [{ date: '2026-02-14', label: 'Moonlit Jam 2026 entry (theme: “Only One Light”)', url: 'https://jam.example/moonlit-2026/last-lamp' }],
+      reviews: [['2026-09-01', 380], ['2027-02-28', 450]], positivePct: 87, copySignal: 0.03, genreSignal: 0.08,
+      reviewSamples: [{ author: 'nightjar', text: 'Tiny, tense, smart. Great jam-to-full-game glow-up.', signal: 'none' }],
+      ai: { music: 'generated' }, aiSource: 'steam', aiQuote: 'From the Steam page AI disclosure: “Background music tracks were generated with AI.”',
+      truth: 'parallel', expected: [['2026-09-01', 'HELD']],
+    },
+    {
+      id: 'one-light-left', case: '8b', scenario: 'Parallel development from the same game-jam theme',
+      title: 'One Light Left', studio: 'Dunmore & Pike', kind: 'game',
+      tags: ['Horror', 'Puzzle'], colors: ['#0a0a0a', '#facc15'],
+      desc: 'Carry the last light through a house that rearranges itself in the dark.',
+      links: { steam: 'https://store.steampowered.com/app/9100802/' },
+      dates: { firstPublicRecord: '2026-02-14', steamPageCreated: '2026-04-20', release: '2026-07-02' },
+      publicRecords: [{ date: '2026-02-14', label: 'Moonlit Jam 2026 entry (theme: “Only One Light”)', url: 'https://jam.example/moonlit-2026/one-light-left' }],
+      reviews: [['2026-09-01', 210], ['2027-02-28', 260]], positivePct: 82, copySignal: 0.06, genreSignal: 0.1,
+      reviewSamples: [{ author: 'cellar_door', text: 'The shifting house trick got me twice.', signal: 'none' }],
+      ai: { code: 'assisted', sfx: 'generated' }, aiSource: 'developer', aiQuote: 'We used an AI coding assistant and generated some creak/ambience SFX.',
+      truth: 'parallel', expected: [['2026-09-01', 'HELD']],
+    },
+
+    // CASE 9 — legit genre-similar game, "like Starfall Spire" reviews → LISTED. Also target of the case-18 claim.
+    {
+      id: 'gloomcard', case: '9 / 18', scenario: 'Genre-similar game with “like Starfall Spire” reviews; target of a weak claim',
+      title: 'Gloomcard Ascent', studio: 'Rookery Lane', kind: 'game',
+      tags: ['Deckbuilder', 'Roguelike', 'Strategy'], colors: ['#3b0764', '#94a3b8'],
+      desc: 'Climb a crumbling rookery with a deck of ravens. Cards remember who played them.',
+      links: { steam: 'https://store.steampowered.com/app/9100901/', dev: 'https://rookerylane.example' },
+      dates: { firstPublicRecord: '2024-05-02', steamPageCreated: '2024-11-01', release: '2025-09-09' },
+      publicRecords: [{ date: '2024-05-02', label: 'Prototype posted to itch', url: 'https://itch.example/rookerylane/gloomcard-proto' }],
+      reviews: [['2026-09-01', 3100], ['2027-02-28', 3400]], positivePct: 92, copySignal: 0.03, genreSignal: 0.41,
+      reviewSamples: [
+        { author: 'deckhand', text: 'Like Starfall Spire, but with ravens and a memory mechanic. Love it.', signal: 'genre' },
+        { author: 'Ilse V.', text: 'If you liked Starfall Spire, this is the next one to play.', signal: 'genre' },
+      ],
+      ai: { code: 'assisted', marketing: 'assisted' }, aiSource: 'developer', aiQuote: 'AI-assisted code completion; trailer captions drafted with AI and edited.',
+      truth: 'original', expected: [['2026-09-01', 'LISTED']],
+    },
+
+    // CASE 10 — chain: original → look-alike → look-alike of the look-alike
+    {
+      id: 'quill-and-crown', case: '10a', scenario: 'Chain: the original',
+      title: 'Quill & Crown', studio: 'Ninefold Studio', kind: 'game',
+      tags: ['Strategy', 'Kingdom Builder', 'Card Game'], colors: ['#78350f', '#fcd34d'],
+      desc: 'Rule by writing decrees. Every law you sign becomes a card your rivals can steal.',
+      links: { steam: 'https://store.steampowered.com/app/9101001/', dev: 'https://ninefold.example' },
+      dates: { firstPublicRecord: '2024-10-10', steamPageCreated: '2025-01-15', release: '2025-08-01' },
+      publicRecords: [{ date: '2024-10-10', label: 'Announcement post', url: 'https://ninefold.example/blog/announcing-quill-and-crown' }],
+      reviews: [['2026-09-01', 2200], ['2027-02-28', 2500]], positivePct: 88, copySignal: 0.02, genreSignal: 0.1,
+      reviewSamples: [{ author: 'chancellor_b', text: 'Decree-cards are a brilliant twist.', signal: 'none' }],
+      registration: {
+        filed: '2026-05-05', by: 'Petra Nine (Ninefold Studio)',
+        evidence: [{ type: 'build_hash', date: '2025-08-01', label: 'Release build', value: 'sha256:9a9a…1102', verifiable: true }],
+      },
+      ai: { music: 'assisted' }, aiSource: 'developer', aiQuote: 'Our composer used AI stem separation and mastering tools.',
+      truth: 'original', expected: [['2026-09-01', 'VERIFIED']],
+    },
+    {
+      id: 'crown-quill-kingdoms', case: '10b', scenario: 'Chain: look-alike of #10a',
+      title: 'Crown & Quill Kingdoms', studio: 'Apexmint Games', kind: 'game',
+      tags: ['Strategy', 'Card Game'], colors: ['#92400e', '#fde68a'],
+      desc: 'Sign decrees, steal laws, rule the kingdom!',
+      links: { steam: 'https://store.steampowered.com/app/9101002/' },
+      dates: { firstPublicRecord: '2026-02-01', steamPageCreated: '2026-02-01', release: '2026-03-15' },
+      reviews: [['2026-09-01', 1200], ['2027-02-28', 1350]], positivePct: 58, copySignal: 0.41, genreSignal: 0.05,
+      namesOriginal: [{ id: 'quill-and-crown', from: '2026-03-20' }],
+      reviewSamples: [{ author: 'chancellor_b', text: 'Straight ripoff of Quill & Crown, even the decree wording.', signal: 'copy' }],
+      ai: { art: 'generated', writing: 'generated', translation: 'generated' }, aiSource: 'steam',
+      aiQuote: 'From the Steam page AI disclosure: “Art, text and translations use generative AI.”',
+      truth: 'non-original', expected: [['2026-09-01', 'HELD']],
+    },
+    {
+      id: 'kingdoms-of-quill', case: '10c', scenario: 'Chain: look-alike of #10b',
+      title: 'Kingdoms of Quill: Royal Edition', studio: 'Zappo Ports', kind: 'game',
+      tags: ['Strategy', 'Casual'], colors: ['#a16207', '#fef9c3'],
+      desc: 'The royal decree card game, now with 50 kingdoms!',
+      links: { steam: 'https://store.steampowered.com/app/9101003/' },
+      dates: { firstPublicRecord: '2026-06-01', steamPageCreated: '2026-06-01', release: '2026-07-10' },
+      reviews: [['2026-09-01', 600], ['2027-02-28', 700]], positivePct: 44, copySignal: 0.52, genreSignal: 0.02,
+      namesOriginal: [{ id: 'crown-quill-kingdoms', from: '2026-07-15' }],
+      reviewSamples: [{ author: 'mintwatch', text: 'Reskin of Crown & Quill Kingdoms with more ads.', signal: 'copy' }],
+      ai: { art: 'generated', runtime: 'generated', marketing: 'generated' }, aiSource: 'steam',
+      aiQuote: 'From the Steam page AI disclosure: “Kingdom names and portraits are generated live by AI.”',
+      truth: 'non-original', expected: [['2026-09-01', 'HELD']],
+    },
+
+    // CASE 11 — legit game review-bombed by a competitor with "ripoff" reviews → HELD (not rejected)
+    {
+      id: 'hearthbound-rails', case: '11', scenario: 'Legit game hit by a competitor’s review campaign',
+      title: 'Hearthbound Rails', studio: 'Copperleaf Games', kind: 'game',
+      tags: ['Simulation', 'Trains', 'Cozy'], colors: ['#7c2d12', '#fca5a5'],
+      desc: 'Run a sleeper train across a snowed-in continent. Keep every carriage warm.',
+      links: { steam: 'https://store.steampowered.com/app/9101101/', dev: 'https://copperleaf.example' },
+      dates: { firstPublicRecord: '2025-08-01', steamPageCreated: '2025-10-01', release: '2026-05-05' },
+      publicRecords: [{ date: '2025-08-01', label: 'Reveal trailer', url: 'https://video.example/watch?v=hearthbound' }],
+      reviews: [['2026-09-01', 900], ['2026-09-20', 920], ['2026-10-27', 1400], ['2026-12-31', 1500]], positivePct: 71,
+      copySignal: [['2026-09-01', 0.02], ['2026-09-20', 0.34], ['2026-11-25', 0.18]], genreSignal: 0.06,
+      reviewSamples: [
+        { author: 'stoker_jo', text: 'Keeping the dining car warm during a blizzard is peak cozy.', signal: 'none' },
+        { author: 'acct_88213', text: 'Ripoff garbage, stolen idea, devs are thieves.', signal: 'copy' },
+      ],
+      ai: { voice: 'assisted' }, aiSource: 'developer', aiQuote: 'Conductor announcements use a licensed synthetic voice tuned by our audio lead.',
+      truth: 'original', expected: [['2026-09-01', 'LISTED'], ['2026-09-20', 'HELD'], ['2026-11-25', 'LISTED']],
+    },
+
+    // CASE 12 — reverse confusion: original released AFTER its look-alike, so reviews call the original "a copy".
+    // NOTE: before the original's reviews name the look-alike (Oct 3), the rules LIST the look-alike. That window
+    // shows up as a worst-case error in the date sweep. Intentional: it is a real gap in the rules as written.
+    {
+      id: 'saltmarrow', case: '12a', scenario: 'Original released after a look-alike (reverse confusion)',
+      title: 'Saltmarrow', studio: 'Fennick Bay Games', kind: 'game',
+      tags: ['Survival', 'Ocean', 'Crafting'], colors: ['#164e63', '#e2e8f0'],
+      desc: 'Harvest bone-coral from a drowned leviathan to keep your raft afloat.',
+      links: { steam: 'https://store.steampowered.com/app/9101201/', dev: 'https://fennickbay.example' },
+      dates: { firstPublicRecord: '2025-12-01', steamPageCreated: '2026-04-10', release: '2026-10-01' },
+      publicRecords: [{ date: '2025-12-01', label: 'Devlog: “The leviathan raft”', url: 'https://fennickbay.example/devlog/leviathan' }],
+      reviews: [['2026-10-01', 0], ['2026-10-27', 150], ['2026-12-31', 400]], positivePct: 80,
+      copySignal: [['2026-10-01', 0], ['2026-10-03', 0.38]], genreSignal: 0.1,
+      namesOriginal: [{ id: 'marrow-tide', from: '2026-10-03' }],
+      reviewSamples: [
+        { author: 'raftbuilder', text: 'Just a copy of Marrow Tide that came out months later.', signal: 'copy' },
+        { author: 'Ines R.', text: 'Bone-coral crafting is deep and weird. Love it.', signal: 'none' },
+      ],
+      ai: { design: 'assisted' }, aiSource: 'developer', aiQuote: 'We used an AI tool to balance-test crafting recipes; designers set every value.',
+      truth: 'original', expected: [['2026-09-01', 'HELD']],
+    },
+    {
+      id: 'marrow-tide', case: '12b', scenario: 'Look-alike released before the original (#12a)',
+      title: 'Marrow Tide', studio: 'Velocity Forge', kind: 'game',
+      tags: ['Survival', 'Ocean'], colors: ['#155e75', '#f1f5f9'],
+      desc: 'Survive on a raft built from the bones of a sea giant!',
+      links: { steam: 'https://store.steampowered.com/app/9101202/' },
+      dates: { firstPublicRecord: '2026-03-01', steamPageCreated: '2026-03-01', release: '2026-06-12' },
+      reviews: [['2026-09-01', 700], ['2027-02-28', 900]], positivePct: 66, copySignal: 0.05, genreSignal: 0.1,
+      reviewSamples: [{ author: 'saltdog', text: 'Decent raft survival.', signal: 'none' }],
+      ai: { art: 'generated', music: 'generated', sfx: 'generated' }, aiSource: 'steam',
+      aiQuote: 'From the Steam page AI disclosure: “Art, music and sound effects were created with generative AI.”',
+      truth: 'non-original', expected: [['2026-09-01', 'LISTED'], ['2026-10-03', 'HELD']],
+    },
+
+    // CASE 13 — false-positive asset match from a shared asset-store pack → QUEUED, resolves as legitimate
+    {
+      id: 'pinewatch', case: '13', scenario: 'Asset match explained by a shared asset-store pack',
+      title: 'Pinewatch', studio: 'Elk & Ember', kind: 'game',
+      tags: ['Simulation', 'Forest', 'Management'], colors: ['#14532d', '#86efac'],
+      desc: 'Staff a fire lookout tower for one summer. Spot smoke, radio crews, keep a journal.',
+      links: { steam: 'https://store.steampowered.com/app/9101301/', dev: 'https://elkandember.example' },
+      dates: { firstPublicRecord: '2025-11-15', steamPageCreated: '2026-02-01', release: '2026-07-01' },
+      publicRecords: [{ date: '2025-11-15', label: 'Reveal trailer', url: 'https://video.example/watch?v=pinewatch' }],
+      reviews: [['2026-09-01', 520], ['2027-02-28', 700]], positivePct: 93, copySignal: 0.02, genreSignal: 0.15,
+      reviewSamples: [{ author: 'ranger_dee', text: 'The radio chatter and journal make this so cozy.', signal: 'none' }],
+      assetMatch: {
+        against: 'thornwake', detected: '2026-10-02', score: 0.64,
+        sharedPack: { name: 'Verdant Lowpoly Forest Pack v2.1', vendor: 'Mossbyte Assets', published: '2024-03-11' },
+        details: [
+          '37 meshes identical to meshes in the Thornwake registered build',
+          'All 37 meshes also appear in the public asset pack “Verdant Lowpoly Forest Pack v2.1” (Mossbyte Assets, published Mar 11, 2024)',
+          'Code overlap: 0.02 (no meaningful overlap)',
+        ],
+      },
+      ai: { sfx: 'generated', art: 'assisted' }, aiSource: 'developer', aiQuote: 'Some wildlife SFX are AI-generated; textures were AI-upscaled and hand-touched.',
+      truth: 'original', expected: [['2026-09-01', 'LISTED'], ['2026-10-02', 'QUEUED'], ['2026-11-12', 'LISTED']],
+    },
+
+    // CASE 14 — new release with few reviews → NOT_YET_ELIGIBLE, becomes LISTED as time passes
+    {
+      id: 'kitebound', case: '14', scenario: 'New release with few reviews',
+      title: 'Kitebound', studio: 'Sundial Pixel', kind: 'game',
+      tags: ['Platformer', 'Wind', 'Short'], colors: ['#0369a1', '#fbcfe8'],
+      desc: 'Ride thermals over a patchwork countryside on a kite stitched from postcards.',
+      links: { steam: 'https://store.steampowered.com/app/9101401/', dev: 'https://sundialpixel.example' },
+      dates: { firstPublicRecord: '2026-08-01', steamPageCreated: '2026-08-01', release: '2026-10-10' },
+      reviews: [['2026-10-10', 0], ['2026-10-27', 14], ['2026-11-12', 40], ['2026-11-16', 55], ['2026-12-31', 150]],
+      positivePct: 95, copySignal: 0, genreSignal: 0.05,
+      reviewSamples: [{ author: 'updraft', text: 'Pure joy for two hours.', signal: 'none' }],
+      ai: { art: 'generated', music: 'generated' }, aiSource: 'steam',
+      aiQuote: 'From the Steam page AI disclosure: “Background paintings and music were generated with AI and arranged by the developer.”',
+      truth: 'original', expected: [['2026-09-01', 'NOT_YET_ELIGIBLE'], ['2026-11-15', 'LISTED']],
+    },
+
+    // CASE 15 — removed from Steam after confirmed takedown → REJECTED
+    {
+      id: 'neon-drifter', case: '15', scenario: 'Removed from Steam after a confirmed takedown',
+      title: 'Neon Drifter X', studio: 'Hexapulse', kind: 'game',
+      tags: ['Racing', 'Arcade'], colors: ['#701a75', '#22d3ee'],
+      desc: 'Drift through a neon city at 300 km/h.',
+      links: { steam: 'https://store.steampowered.com/app/9101501/' },
+      dates: { firstPublicRecord: '2025-12-01', steamPageCreated: '2025-12-01', release: '2026-02-14' },
+      removed: { date: '2026-08-14', reason: 'Removed from Steam following a confirmed copyright takedown' },
+      reviews: 330, positivePct: 50, copySignal: 0.2,
+      ai: { art: 'generated' }, aiSource: 'steam', aiQuote: 'From the Steam page AI disclosure (archived): “Some assets AI-generated.”',
+      truth: 'n/a', expected: [['2026-09-01', 'REJECTED']],
+    },
+
+    // CASE 17 — duplicate listing → REJECTED
+    {
+      id: 'wayfarers-loom-dup', case: '17', scenario: 'Duplicate listing of #20',
+      title: 'Wayfarer’s Loom (Early Access)', studio: 'Tallgrass Workshop', kind: 'game', duplicateOf: 'wayfarers-loom',
+      tags: ['RPG'], colors: ['#365314', '#fef3c7'], desc: 'Duplicate store record created during a publisher migration.',
+      links: { steam: 'https://store.steampowered.com/app/9101701/' },
+      dates: { steamPageCreated: '2026-03-03', release: '2026-03-03' }, earlyAccess: true, reviews: 12, positivePct: 90, copySignal: 0,
+      ai: { runtime: 'generated', writing: 'assisted' }, aiSource: 'steam', aiQuote: 'Same disclosure as the primary listing.',
+      truth: 'n/a', expected: [['2026-09-01', 'REJECTED']],
+    },
+
+    // CASE 19 — another party registered the real developer's material first
+    {
+      id: 'gilded-mire', case: '19a', scenario: 'Real developer registered after another party did',
+      title: 'Gilded Mire', studio: 'Rookhazel Games', kind: 'game',
+      tags: ['Adventure', 'Swamp', 'Hand-painted'], colors: ['#3f6212', '#facc15'],
+      desc: 'A swamp witch gilds the bog one lily pad at a time. Anything gilded can be spoken to.',
+      links: { dev: 'https://rookhazel.example/gilded-mire' },
+      dates: { firstPublicRecord: '2026-05-12', steamPageCreated: null, release: null },
+      publicRecords: [
+        { date: '2026-05-12', label: 'Devlog #1 with concept art', url: 'https://rookhazel.example/devlog/1-concept-art' },
+        { date: '2026-07-01', label: 'Playable prototype posted to itch', url: 'https://itch.example/rookhazel/gilded-mire-proto' },
+      ],
+      reviews: 0, copySignal: 0,
+      registration: {
+        filed: '2026-10-15', by: 'Hazel Rook (Rookhazel Games)',
+        evidence: [
+          { type: 'devlog', date: '2026-05-12', label: 'Devlog #1 with concept art', value: 'https://rookhazel.example/devlog/1-concept-art', verifiable: true },
+          { type: 'teaser', date: '2026-07-01', label: 'itch prototype page', value: 'https://itch.example/rookhazel/gilded-mire-proto', verifiable: true },
+          { type: 'git', date: '2026-03-30', label: 'Repository history, first commit', value: 'git:b4d55e1', verifiable: false },
+        ],
+      },
+      ai: {}, aiSource: 'developer', aiQuote: 'No AI used — every lily pad is hand-painted.',
+      truth: 'original', expected: [['2026-10-15', 'QUEUED']],
+    },
+    {
+      id: 'gildmarsh', case: '19b', scenario: 'Party that registered #19a’s material first',
+      title: 'Gildmarsh', studio: 'Fastlane Interactive LLC', kind: 'game',
+      tags: ['Adventure', 'Swamp'], colors: ['#4d7c0f', '#fde047'],
+      desc: 'A witch turns a swamp to gold. Talk to everything you gild.',
+      links: { dev: 'https://fastlane-interactive.example/gildmarsh' },
+      dates: { firstPublicRecord: null, steamPageCreated: null, release: null },
+      reviews: 0, copySignal: 0,
+      registration: {
+        filed: '2026-09-05', by: 'J. Calloway (Fastlane Interactive LLC)',
+        evidence: [
+          { type: 'concept_art', date: '2026-09-01', label: 'Concept art set (12 images)', value: 'sha256:9f2c…a17e', verifiable: false },
+          { type: 'document', date: '2026-09-03', label: 'Design document', value: 'sha256:44e0…d0b9', verifiable: false },
+        ],
+      },
+      ai: { art: 'assisted', writing: 'generated', marketing: 'generated' }, aiSource: 'developer',
+      aiQuote: 'Concept art was refined with AI tools; story outline generated with AI.',
+      truth: 'non-original', expected: [['2026-09-05', 'QUEUED']],
+    },
+
+    // CASE 20 — Early Access game (released, reviewable) → evaluated like a released game
+    {
+      id: 'wayfarers-loom', case: '20', scenario: 'Early Access game',
+      title: 'Wayfarer’s Loom', studio: 'Tallgrass Workshop', kind: 'game', earlyAccess: true,
+      tags: ['RPG', 'Open World', 'Early Access'], colors: ['#365314', '#fef3c7'],
+      desc: 'Weave the roads you travel. Every thread you pull changes the map — and the people on it.',
+      links: { steam: 'https://store.steampowered.com/app/9102001/', dev: 'https://tallgrass.example' },
+      dates: { firstPublicRecord: '2025-07-07', steamPageCreated: '2025-10-10', release: '2026-03-03' },
+      publicRecords: [{ date: '2025-07-07', label: 'Announcement trailer', url: 'https://video.example/watch?v=wayfarer' }],
+      reviews: [['2026-09-01', 640], ['2027-02-28', 820]], positivePct: 84, copySignal: 0.02, genreSignal: 0.2,
+      reviewSamples: [{ author: 'loomer', text: 'Early Access but already huge. The road-weaving is unique.', signal: 'none' }],
+      ai: { runtime: 'generated', writing: 'assisted' }, aiSource: 'steam',
+      aiQuote: 'From the Steam page AI disclosure: “Some NPC chatter is generated live by an AI model with content filters.”',
+      truth: 'original', expected: [['2026-09-01', 'LISTED']],
+    },
+
+    // CASE 21 — previously rejected registration, appealed with new evidence → QUEUED as an appeal
+    {
+      id: 'quarry-of-echoes', case: '21', scenario: 'Rejected registration, appealed with new evidence',
+      title: 'Quarry of Echoes', studio: 'Slatebird Games', kind: 'game',
+      tags: ['Puzzle', 'Audio', 'Atmospheric'], colors: ['#334155', '#93c5fd'],
+      desc: 'Solve a mine by listening. Every echo is a map.',
+      links: { steam: 'https://store.steampowered.com/app/9102101/', dev: 'https://slatebird.example' },
+      dates: { firstPublicRecord: '2025-11-20', steamPageCreated: '2026-05-01', release: '2026-08-01' },
+      publicRecords: [{ date: '2025-11-20', label: 'Teaser post (archived)', url: 'https://archive.example/2025/slatebird-teaser' }],
+      reviews: [['2026-09-01', 140], ['2027-02-28', 260]], positivePct: 90, copySignal: 0.01,
+      reviewSamples: [{ author: 'cavern_kid', text: 'Play with headphones. Trust me.', signal: 'none' }],
+      registration: {
+        filed: '2026-06-01', by: 'Bea Slate (Slatebird Games)',
+        evidence: [{ type: 'concept_art', date: '2025-10-01', label: 'Screenshots of early builds', value: '(images only)', verifiable: false }],
+      },
+      ai: { voice: 'generated', code: 'assisted' }, aiSource: 'developer', aiQuote: 'The narrator voice is AI-generated (licensed); some code AI-assisted.',
+      truth: 'original', expected: [['2026-09-01', 'REJECTED'], ['2026-10-20', 'QUEUED']],
+    },
+
+    // EXTRA — AI-filter coverage and an upheld idea claim on a listed game
+    {
+      id: 'velvet-static', case: 'x1', scenario: 'AI-filter coverage: generated voice + runtime',
+      title: 'Velvet Static', studio: 'Lowtide Radio', kind: 'game',
+      tags: ['Narrative', 'Audio Drama', 'Mystery'], colors: ['#4c0519', '#f9a8d4'],
+      desc: 'Host a late-night call-in radio show where the callers might not be alive.',
+      links: { steam: 'https://store.steampowered.com/app/9102201/' },
+      dates: { firstPublicRecord: '2025-03-03', steamPageCreated: '2025-05-05', release: '2025-10-31' },
+      reviews: [['2026-09-01', 980], ['2027-02-28', 1100]], positivePct: 77, copySignal: 0.0,
+      reviewSamples: [{ author: 'nightowl', text: 'Every call is different. Creepy in the best way.', signal: 'none' }],
+      ai: { voice: 'generated', runtime: 'generated', writing: 'assisted' }, aiSource: 'steam',
+      aiQuote: 'From the Steam page AI disclosure: “Caller voices and some dialogue are generated live by AI.”',
+      truth: 'original', expected: [['2026-09-01', 'LISTED']],
+    },
+    {
+      id: 'fathom-choir', case: 'x2', scenario: 'AI-filter coverage: generated music only',
+      title: 'Fathom Choir', studio: 'Deepwell Games', kind: 'game',
+      tags: ['Rhythm', 'Underwater', 'Relaxing'], colors: ['#172554', '#5eead4'],
+      desc: 'Conduct a choir of whales through an ocean trench.',
+      links: { steam: 'https://store.steampowered.com/app/9102202/', dev: 'https://deepwell.example' },
+      dates: { firstPublicRecord: '2024-10-01', steamPageCreated: '2024-12-01', release: '2025-04-04' },
+      reviews: [['2026-09-01', 1500], ['2027-02-28', 1650]], positivePct: 85, copySignal: 0.0,
+      reviewSamples: [{ author: 'krill_fan', text: 'Beautiful and strange.', signal: 'none' }],
+      ai: { music: 'generated', sfx: 'assisted' }, aiSource: 'developer', aiQuote: 'Whale-song melodies are generated by an AI model we trained on our own recordings.',
+      truth: 'original', expected: [['2026-09-01', 'LISTED']],
+    },
+    {
+      id: 'sproutling-inn', case: 'x3', scenario: 'Upheld idea claim on a listed game (timeline shown)',
+      title: 'Sproutling Inn', studio: 'Honeyjar Co-op', kind: 'game',
+      tags: ['Management', 'Cozy', 'Farming'], colors: ['#365314', '#fda4af'],
+      desc: 'Run an inn for travelling seedlings. Guests grow while they sleep.',
+      links: { steam: 'https://store.steampowered.com/app/9102203/', dev: 'https://honeyjar.example' },
+      dates: { firstPublicRecord: '2024-11-02', steamPageCreated: '2025-02-01', release: '2025-07-15' },
+      reviews: [['2026-09-01', 2400], ['2027-02-28', 2600]], positivePct: 90, copySignal: 0.04,
+      reviewSamples: [{ author: 'tea_kettle', text: 'My guests turned into sunflowers overnight. 10/10.', signal: 'none' }],
+      ai: { translation: 'generated', marketing: 'generated', code: 'assisted', design: 'assisted' }, aiSource: 'developer',
+      aiQuote: 'Translations and trailer voice-over script were AI-generated; we use AI help for code and balancing.',
+      truth: 'idea-overlap', expected: [['2026-09-01', 'LISTED']],
+    },
+  ],
+
+  // ---- Similarity pairs (scores 0..1). Collision = max(title, description, screenshots, keywords) ≥ threshold
+  similarity: [
+    { a: 'origami-grove', b: 'paper-orchard', title: 0.58, description: 0.81, screenshots: 0.88, keywords: 0.77, note: 'Crease-preview UI and orchard level-select map' },
+    { a: 'glowmoss', b: 'lumen-moss', title: 0.35, description: 0.78, screenshots: 0.86, keywords: 0.83, note: 'Compared against teaser frames registered by Fernhill Collective' },
+    { a: 'bastion-of-thorns', b: 'thornwake', title: 0.52, description: 0.70, screenshots: 0.91, keywords: 0.66, note: 'Opening area layout and fog' },
+    { a: 'last-lamp', b: 'one-light-left', title: 0.71, description: 0.80, screenshots: 0.41, keywords: 0.84, note: 'Both list “Moonlit Jam 2026 — theme: Only One Light”' },
+    { a: 'crown-quill-kingdoms', b: 'quill-and-crown', title: 0.79, description: 0.83, screenshots: 0.87, keywords: 0.80, note: 'Decree-card layout and wording' },
+    { a: 'kingdoms-of-quill', b: 'crown-quill-kingdoms', title: 0.74, description: 0.88, screenshots: 0.93, keywords: 0.85, note: 'Near-identical UI' },
+    { a: 'kingdoms-of-quill', b: 'quill-and-crown', title: 0.70, description: 0.79, screenshots: 0.82, keywords: 0.78, note: 'Decree-card mechanic' },
+    { a: 'saltmarrow', b: 'marrow-tide', title: 0.66, description: 0.84, screenshots: 0.79, keywords: 0.81, note: 'Leviathan-bone raft' },
+    { a: 'gildmarsh', b: 'gilded-mire', title: 0.55, description: 0.86, screenshots: 0.94, keywords: 0.88, note: 'Registered concept art perceptually matches images in Rookhazel devlog #1' },
+    { a: 'pinewatch', b: 'thornwake', title: 0.20, description: 0.41, screenshots: 0.62, keywords: 0.38, note: 'Shared forest meshes' },
+  ],
+
+  // ---- User idea claims ("this game used my publicly shown concept") ---------------------------
+  // Evidence bar: dated public source link + source date earlier than target's first public record
+  //               + at least one specific, distinctive overlap (genre-level overlap does not count).
+  claims: [
+    {
+      id: 'c-cinder', case: '5', targetId: 'cinder-courier', claimant: 'Mira Okafor', claimantProject: 'Ashpost (in development)',
+      filed: '2026-10-18', sourceLink: 'https://social.example/miraokafor/status/77310', sourceDate: '2026-08-03',
+      concept: 'A courier delivering mail through a burning city, where the letters themselves are burned as fuel for the cart.',
+      overlaps: [
+        { text: 'Letters carried are burned as fuel for the delivery cart', kind: 'distinctive' },
+        { text: 'City map where fire spreads on a visible timer between deliveries', kind: 'distinctive' },
+        { text: 'NPC called “the Postwarden” who assigns routes', kind: 'distinctive' },
+      ],
+      expectedBar: true,
+    },
+    {
+      id: 'c-vexley', case: '18', targetId: 'gloomcard', claimant: 'R. Vexley', claimantProject: 'Tower of Cards (concept)',
+      filed: '2026-10-12', sourceLink: 'https://social.example/rvexley/post/88213', sourceDate: '2026-05-01',
+      concept: 'A deckbuilder where you climb a tower.',
+      overlaps: [
+        { text: 'Roguelike deckbuilder where you climb a tower', kind: 'genre' },
+        { text: 'Cards have energy costs', kind: 'genre' },
+      ],
+      expectedBar: false,
+    },
+    {
+      id: 'c-sprout', case: 'x3', targetId: 'sproutling-inn', claimant: 'Tomas Reyes', claimantProject: 'Seedling Lodge (paused)',
+      filed: '2026-06-01', sourceLink: 'https://forum.example/indie/showcase/4412', sourceDate: '2024-09-01',
+      concept: 'An inn whose guests are seedlings that grow overnight depending on the room they sleep in.',
+      overlaps: [{ text: 'Guests are plants that grow overnight based on their room', kind: 'distinctive' }],
+      expectedBar: true,
+    },
+  ],
+
+  // ---- Appeals (from held/rejected developers) -------------------------------------------------
+  appeals: [
+    {
+      id: 'ap-quarry', gameId: 'quarry-of-echoes', filed: '2026-10-20',
+      statement: 'Our first submission only had screenshots. We now have our repository export and an archived copy of our 2025 teaser.',
+      newEvidence: ['Git history export (first commit Jul 2, 2025)', 'Archived snapshot of the Nov 20, 2025 teaser post'],
+    },
+  ],
+
+  // ---- Scripted moderator decisions (the simulation applies each one on its date) -------------
+  // triggerId: 'reg:<gameId>' | 'asset:<gameId>' | 'claim:<claimId>' | 'appeal:<appealId>' | 'held:<gameId>'
+  // action:    'approve' | 'reject' | 'clear' (final)  ·  'request_info' | 'notify' (annotations)
+  moderationLog: [
+    { date: '2026-03-20', triggerId: 'reg:thornwake', action: 'approve', by: 'mod.ines', note: 'Build hashes and repo history consistent with public devlogs from Jun 2025.' },
+    { date: '2026-05-19', triggerId: 'reg:quill-and-crown', action: 'approve', by: 'mod.okoro', note: 'Announcement post and release build verified.' },
+    { date: '2026-06-20', triggerId: 'reg:quarry-of-echoes', action: 'reject', by: 'mod.okoro', internalReason: 'Evidence was screenshots only; no hashes, links, or repository history to establish dates.' },
+    { date: '2026-06-25', triggerId: 'claim:c-sprout', action: 'approve', by: 'mod.ines', note: 'Forum showcase post is dated and shows the overnight-growth room mechanic.' },
+    { date: '2026-07-20', triggerId: 'reg:paper-orchard', action: 'approve', by: 'mod.ines', note: 'Festival demo build hash matches festival archive.' },
+    { date: '2026-10-09', triggerId: 'asset:bastion-of-thorns', action: 'notify', by: 'mod.okoro', note: 'Right-of-response notice sent to Grayline Digital.' },
+    { date: '2026-10-14', triggerId: 'reg:tidewright', action: 'approve', by: 'mod.ines', note: 'Devlog and build hash consistent.' },
+    { date: '2026-10-24', triggerId: 'reg:gildmarsh', action: 'request_info', by: 'mod.okoro', note: 'Requested layered source files for the concept art set.' },
+    { date: '2026-11-12', triggerId: 'asset:pinewatch', action: 'approve', by: 'mod.ines', note: 'All 37 matched meshes come from Verdant Lowpoly Forest Pack v2.1; both studios hold licences.' },
+    { date: '2026-11-20', triggerId: 'claim:c-cinder', action: 'approve', by: 'mod.okoro', note: 'Source post is dated Aug 3 and shows all three distinctive elements.' },
+  ],
+};
+</script>
+
+<!-- ======================================================================================
+     2. RULES ENGINE  (pure functions — no DOM, no React)
+     ======================================================================================
+  Order of evaluation for each game at simulated date D:
+    0. Not yet known to the system (no Steam page, no registration)      → null
+    1. Non-accusatory automatic outcomes: DLC → ATTACHED; soundtrack/tool, removed/takedown,
+       content policy, duplicate                                          → REJECTED
+    2. Prior moderator rejection: open appeal WITH new evidence           → QUEUED (appeal)
+                                  otherwise                               → REJECTED
+    3. Registration approved by a moderator                               → VERIFIED
+    4. Stakeholder waiting (registration, asset/code match against a registered build,
+       claim meeting the evidence bar, appeal)                            → QUEUED (priority = max trigger)
+    5. Fact checks: copy-signal / named-as-original / similarity collision → HELD
+                    only release-age / review-count failing               → NOT_YET_ELIGIBLE
+                    everything passes                                     → LISTED
+  Similarity collisions only count against partners in the reference set R:
+    R = games with a pending/approved registration, VERIFIED games, and games that would be
+        LISTED on every check except collisions. (Avoids status A depending on status B and back.)
+-->
+<script id="rules-engine">
+const Engine = (() => {
+  const DAY = 86400000;
+  const toMs = d => Date.UTC(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8, 10));
+  const daysBetween = (a, b) => Math.round((toMs(b) - toMs(a)) / DAY);
+  const addDays = (d, n) => new Date(toMs(d) + n * DAY).toISOString().slice(0, 10);
+  const minDate = (...ds) => ds.filter(Boolean).sort()[0] || null;
+  const fmt = d => d ? new Date(toMs(d)).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }) : '—';
+  const weekStart = d => addDays(d, -((new Date(toMs(d)).getUTCDay() + 6) % 7));
+
+  const FINAL_ACTIONS = ['approve', 'reject', 'clear'];
+  const PUBLIC = ['LISTED', 'VERIFIED'];
+  const EVIDENCE_LABEL = { build_hash: 'Build hash', concept_art: 'Concept art', teaser: 'Teaser link', devlog: 'Dev log', git: 'Git history', document: 'Document' };
+
+  // --- time series helpers ------------------------------------------------------------------
+  function seriesAt(series, date, linear) {
+    if (series == null) return 0;
+    if (typeof series === 'number') return series;
+    if (!series.length || date < series[0][0]) return 0;
+    for (let i = series.length - 1; i >= 0; i--) {
+      if (series[i][0] > date) continue;
+      if (linear && i < series.length - 1) {
+        const [d0, v0] = series[i], [d1, v1] = series[i + 1];
+        return v0 + (v1 - v0) * daysBetween(d0, date) / daysBetween(d0, d1);
+      }
+      return series[i][1];
+    }
+    return 0;
+  }
+  const reviewsAt = (g, d) => Math.floor(seriesAt(g.reviews, d, true));
+  const copySignalAt = (g, d) => seriesAt(g.copySignal, d, false);
+
+  // --- world assembly: mock data + anything created during this browser session -------------
+  function buildWorld(mock, session) {
+    const games = mock.games
+      .map(g => session.registrations[g.id] ? { ...g, registration: session.registrations[g.id], sessionRegistration: true } : g)
+      .concat(session.games);
+    const log = mock.moderationLog.map((e, i) => ({ ...e, seq: i, scripted: true }))
+      .concat(session.log.map((e, i) => ({ ...e, seq: 100000 + i, scripted: false })));
+    log.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.seq - b.seq));
+    return {
+      games,
+      byId: Object.fromEntries(games.map(g => [g.id, g])),
+      similarity: mock.similarity,
+      claims: mock.claims.concat(session.claims),
+      appeals: mock.appeals.concat(session.appeals),
+      log,
+      sim: mock.simulation,
+    };
+  }
+
+  const knownFrom = g => minDate(g.dates.steamPageCreated, g.registration && g.registration.filed);
+  const isKnown = (g, date) => { const k = knownFrom(g); return !!k && k <= date; };
+  const earliestPublic = g => minDate(g.dates.firstPublicRecord, g.dates.steamPageCreated, g.dates.release, ...(g.publicRecords || []).map(r => r.date));
+  // Earliest record whose date a third party can confirm (public records + verifiable evidence)
+  const earliestIndependent = g => minDate(earliestPublic(g), ...((g.registration && g.registration.evidence) || []).filter(e => e.verifiable).map(e => e.date));
+
+  // --- moderator decisions --------------------------------------------------------------------
+  function decisionIndex(world, date) {
+    const idx = {};
+    for (const e of world.log) if (e.date <= date) (idx[e.triggerId] = idx[e.triggerId] || []).push(e);
+    return idx;
+  }
+  const finalDecision = (idx, tid) => { const es = (idx[tid] || []).filter(e => FINAL_ACTIONS.includes(e.action)); return es[es.length - 1] || null; };
+  const annotations = (idx, tid) => (idx[tid] || []).filter(e => !FINAL_ACTIONS.includes(e.action));
+
+  function triggerGameId(world, tid) {
+    const [type, ref] = [tid.slice(0, tid.indexOf(':')), tid.slice(tid.indexOf(':') + 1)];
+    if (type === 'claim') { const c = world.claims.find(x => x.id === ref); return c && c.targetId; }
+    if (type === 'appeal') { const a = world.appeals.find(x => x.id === ref); return a && a.gameId; }
+    return ref;
+  }
+
+  function registrationState(g, date, idx) {
+    if (!g.registration || g.registration.filed > date) return { state: 'none' };
+    const d = finalDecision(idx, 'reg:' + g.id);
+    if (!d) return { state: 'pending' };
+    return { state: d.action === 'approve' ? 'approved' : 'rejected', decision: d };
+  }
+  const isPrerelease = g => !!g.registration && (!g.dates.release || g.dates.release > g.registration.filed);
+
+  function latestRejection(g, idx) {
+    return ['reg:', 'asset:', 'manual:'].map(p => finalDecision(idx, p + g.id))
+      .filter(d => d && d.action === 'reject')
+      .sort((a, b) => (a.date < b.date ? -1 : 1)).pop() || null;
+  }
+
+  // --- claims evidence bar ------------------------------------------------------------------
+  function claimBar(claim, world, S) {
+    const t = world.byId[claim.targetId];
+    const tFirst = t ? earliestPublic(t) : null;
+    const checks = [
+      { label: 'Dated public source link provided', ok: !!(claim.sourceLink && claim.sourceDate) },
+      { label: `Source is dated earlier than the target’s first public record${tFirst ? ` (${fmt(tFirst)})` : ''}`, ok: !!(claim.sourceDate && tFirst && claim.sourceDate < tFirst) },
+      { label: 'Names at least one specific, distinctive overlap (genre-level overlap does not count)', ok: !S.CLAIM_REQUIRES_DISTINCTIVE_OVERLAP || (claim.overlaps || []).some(o => o.kind === 'distinctive' && o.text.trim()) },
+    ];
+    return { ok: checks.every(c => c.ok), checks };
+  }
+
+  function similarPairs(g, world) {
+    return world.similarity.filter(p => p.a === g.id || p.b === g.id).map(p => ({
+      ...p, other: p.a === g.id ? p.b : p.a, score: Math.max(p.title, p.description, p.screenshots, p.keywords),
+    }));
+  }
+
+  // --- stage 1–5 evaluation (collisions applied afterwards in evaluateAll) -------------------
+  function evaluateBase(g, ctx) {
+    const { date, S, world, idx, named } = ctx;
+    const out = { id: g.id, status: null, reasons: [], triggers: [], checks: null, notes: [], collisions: [], similar: [], cleared: false };
+    const done = (status, ...reasons) => { out.status = status; out.reasons.push(...reasons); return out; };
+    if (!isKnown(g, date)) return done(null, 'Not in the system yet');
+
+    // 1. Non-accusatory automatic outcomes
+    if (g.kind === 'dlc') { const p = world.byId[g.parentId]; return done('ATTACHED', `DLC — attached to parent game “${p ? p.title : g.parentId}”`); }
+    if (g.kind && g.kind !== 'game') return done('REJECTED', `Not a game (${g.kind})`);
+    if (g.removed && g.removed.date <= date) return done('REJECTED', `${g.removed.reason} (${fmt(g.removed.date)})`);
+    if (g.contentPolicy === 'violation') return done('REJECTED', 'Outside content policy');
+    if (g.duplicateOf) { const o = world.byId[g.duplicateOf]; return done('REJECTED', `Duplicate listing of “${o ? o.title : g.duplicateOf}”`); }
+
+    // 2. Prior moderator rejection, and appeals against it
+    const rej = latestRejection(g, idx);
+    const appeals = world.appeals.filter(a => a.gameId === g.id && a.filed <= date);
+    let lifted = null;
+    if (rej) {
+      const after = appeals.filter(a => a.filed >= rej.date);
+      lifted = after.map(a => finalDecision(idx, 'appeal:' + a.id)).find(d => d && d.action === 'approve') || null;
+      if (!lifted) {
+        const open = after.filter(a => !finalDecision(idx, 'appeal:' + a.id));
+        const withEvidence = open.find(a => (a.newEvidence || []).length);
+        if (withEvidence) {
+          out.triggers.push({ id: 'appeal:' + withEvidence.id, type: 'appeal', priority: S.PRIORITY_APPEAL, since: withEvidence.filed, label: 'Appeal with new evidence' });
+          out.priority = S.PRIORITY_APPEAL; out.since = withEvidence.filed;
+          return done('QUEUED', 'Appeal of a moderator rejection, with new evidence');
+        }
+        if (open.length) out.notes.push(`Appeal filed ${fmt(open[0].filed)} has no new evidence, so it was not re-queued`);
+        out.internalReason = rej.internalReason || rej.note;
+        return done('REJECTED', `Rejected by a moderator on ${fmt(rej.date)}; no new evidence since`);
+      }
+      out.notes.push(`Rejection of ${fmt(rej.date)} lifted on appeal (${fmt(lifted.date)})`);
+    }
+
+    // 3. Verified (human decision only)
+    const rs = registrationState(g, date, idx);
+    if (rs.state === 'approved' || (lifted && g.registration)) {
+      out.verifiedOn = rs.state === 'approved' ? rs.decision.date : lifted.date;
+      return done('VERIFIED', `Provenance verified by a moderator on ${fmt(out.verifiedOn)}`);
+    }
+
+    // 4. Stakeholder waiting → QUEUED
+    const pairs = similarPairs(g, world).filter(p => world.byId[p.other] && isKnown(world.byId[p.other], date));
+    if (rs.state === 'pending') {
+      const pre = isPrerelease(g);
+      const live = pairs.filter(p => {
+        const o = world.byId[p.other];
+        return p.score >= S.SIMILARITY_THRESHOLD && o.dates.release && o.dates.release <= date && !(o.removed && o.removed.date <= date);
+      });
+      out.triggers.push({
+        id: 'reg:' + g.id, type: 'registration', since: g.registration.filed,
+        priority: (pre ? S.PRIORITY_PRERELEASE_REGISTRATION : S.PRIORITY_REGISTRATION) + (live.length ? S.PRIORITY_BOOST_LIVE_LOOKALIKE : 0),
+        label: (pre ? 'Pre-release registration' : 'Developer registration') + (live.length ? ' · similar game already live' : ''),
+      });
+    }
+    if (g.assetMatch && g.assetMatch.detected <= date) {
+      const against = world.byId[g.assetMatch.against];
+      const ars = against ? registrationState(against, date, idx).state : 'none';
+      if (ars === 'pending' || ars === 'approved') {
+        const d = finalDecision(idx, 'asset:' + g.id);
+        if (!d) out.triggers.push({ id: 'asset:' + g.id, type: 'asset', priority: S.PRIORITY_ASSET_MATCH, since: g.assetMatch.detected, label: `Asset/code match vs registered build (${g.assetMatch.score.toFixed(2)})` });
+        else if (d.action === 'approve') out.notes.push(`Asset/code match reviewed ${fmt(d.date)}: resolved as legitimate`);
+      }
+    }
+    for (const c of world.claims.filter(c => c.targetId === g.id && c.filed <= date)) {
+      const d = finalDecision(idx, 'claim:' + c.id);
+      if (d) { out.notes.push(`Idea claim ${c.id} ${d.action === 'approve' ? 'upheld' : 'dismissed'} on ${fmt(d.date)}`); continue; }
+      if (claimBar(c, world, S).ok) out.triggers.push({ id: 'claim:' + c.id, type: 'claim', priority: S.PRIORITY_CLAIM, since: c.filed, label: `Idea claim by ${c.claimant}` });
+      else out.notes.push(`Idea claim ${c.id} (${c.claimant}) is below the evidence bar — no effect on this record`);
+    }
+    if (!rej) for (const a of appeals) {
+      if (!finalDecision(idx, 'appeal:' + a.id)) out.triggers.push({ id: 'appeal:' + a.id, type: 'appeal', priority: S.PRIORITY_APPEAL, since: a.filed, label: 'Appeal from developer' });
+    }
+    if (out.triggers.length) {
+      out.priority = Math.max(...out.triggers.map(t => t.priority));
+      out.since = minDate(...out.triggers.map(t => t.since));
+      return done('QUEUED', ...out.triggers.map(t => t.label));
+    }
+
+    // 5. Fact checks
+    const heldClear = finalDecision(idx, 'held:' + g.id);
+    const appealOk = appeals.some(a => (finalDecision(idx, 'appeal:' + a.id) || {}).action === 'approve');
+    out.cleared = !!lifted || appealOk || (heldClear && heldClear.action === 'clear');
+    const rel = g.dates.release && g.dates.release <= date ? g.dates.release : null;
+    const age = rel ? daysBetween(rel, date) : null;
+    const reviews = reviewsAt(g, date);
+    const copy = copySignalAt(g, date);
+    const namedBy = named[g.id] || [];
+    out.checks = {
+      age: { label: 'Days since release', ok: age !== null && age >= S.MIN_DAYS_RELEASED, value: age === null ? 'unreleased' : `${age}${g.earlyAccess ? ' (Early Access)' : ''}`, need: `≥ ${S.MIN_DAYS_RELEASED}` },
+      reviews: { label: 'Review count', ok: reviews >= S.MIN_REVIEWS, value: reviews, need: `≥ ${S.MIN_REVIEWS}` },
+      copy: { label: 'Review copy-signal score', ok: copy < S.COPY_SIGNAL_THRESHOLD, value: copy.toFixed(2), need: `< ${S.COPY_SIGNAL_THRESHOLD}`, extra: g.genreSignal ? `genre comparisons excluded: ${g.genreSignal.toFixed(2)}` : '' },
+      named: { label: 'Named as the original on another game’s page', ok: !S.NAMED_AS_ORIGINAL_CHECK || !namedBy.length, value: namedBy.length ? 'by ' + namedBy.map(n => world.byId[n.by].title).join(', ') : 'no', need: S.NAMED_AS_ORIGINAL_CHECK ? 'no' : '(check disabled)' },
+    };
+    if (out.cleared) out.notes.push('Signals cleared by a moderator; copy-signal, naming and similarity checks waived');
+    const signalFails = [];
+    if (!out.checks.copy.ok) signalFails.push(`Review copy-signal score ${copy.toFixed(2)} ≥ ${S.COPY_SIGNAL_THRESHOLD}`);
+    if (!out.checks.named.ok) signalFails.push(`Named as the original in reviews on ${out.checks.named.value.slice(3)}`);
+    if (!out.cleared && signalFails.length) return done('HELD', ...signalFails);
+    if (!out.checks.age.ok || !out.checks.reviews.ok) {
+      return done('NOT_YET_ELIGIBLE', ...[
+        !out.checks.age.ok && (age === null ? 'Not released yet' : `Released ${age} days ago (needs ${S.MIN_DAYS_RELEASED})`),
+        !out.checks.reviews.ok && `${reviews} reviews (needs ${S.MIN_REVIEWS})`,
+      ].filter(Boolean));
+    }
+    return done('LISTED', 'Passes every automatic check');
+  }
+
+  function evaluateAll(world, date, S) {
+    const idx = decisionIndex(world, date);
+    const named = {};
+    for (const h of world.games) {
+      if (!isKnown(h, date)) continue;
+      for (const n of h.namesOriginal || []) if (n.from <= date) (named[n.id] = named[n.id] || []).push({ by: h.id, from: n.from });
+    }
+    const ctx = { date, S, world, idx, named };
+    const res = {};
+    for (const g of world.games) res[g.id] = evaluateBase(g, ctx);
+
+    // Reference set R for similarity collisions (see header comment)
+    // Snapshot R from the base results BEFORE applying collisions, so evaluation order doesn't matter.
+    const R = new Set(world.games.filter(g => {
+      const r = res[g.id];
+      if (!r.status || r.status === 'REJECTED' || r.status === 'ATTACHED') return false;
+      const rs = registrationState(g, date, idx).state;
+      return rs === 'pending' || rs === 'approved' || PUBLIC.includes(r.status);
+    }).map(g => g.id));
+    const inR = id => R.has(id);
+    for (const g of world.games) {
+      const r = res[g.id];
+      if (!r.status) continue;
+      r.similar = similarPairs(g, world)
+        .filter(p => world.byId[p.other] && isKnown(world.byId[p.other], date))
+        .map(p => ({ ...p, otherInR: inR(p.other) }));
+      r.collisions = r.similar.filter(p => p.score >= S.SIMILARITY_THRESHOLD && p.otherInR);
+      if (r.checks) r.checks.collision = {
+        label: 'Similarity collision with a listed/registered game', ok: !r.collisions.length || r.cleared,
+        value: r.collisions.length ? r.collisions.map(p => `${world.byId[p.other].title} (${p.score.toFixed(2)})`).join(', ') : 'none', need: `none ≥ ${S.SIMILARITY_THRESHOLD}`,
+      };
+      if (['LISTED', 'NOT_YET_ELIGIBLE', 'HELD'].includes(r.status) && r.collisions.length && !r.cleared) {
+        if (r.status !== 'HELD') { r.status = 'HELD'; r.reasons = []; }
+        r.reasons.push(`Similarity ≥ ${S.SIMILARITY_THRESHOLD} with ${r.collisions.map(p => `“${world.byId[p.other].title}” (${p.score.toFixed(2)})`).join(', ')}`);
+      }
+    }
+    return res;
+  }
+
+  // --- expectations & tests -----------------------------------------------------------------
+  function expectedAt(g, date) {
+    let s = null;
+    for (const [d, st] of g.expected || []) if (d <= date) s = st;
+    return s;
+  }
+  function sessionTouched(world, gameId, date) {
+    const g = world.byId[gameId];
+    if (g.sessionRegistration && g.registration.filed <= date) return true;
+    if (world.log.some(e => !e.scripted && e.date <= date && triggerGameId(world, e.triggerId) === gameId)) return true;
+    if (world.claims.some(c => c.session && c.targetId === gameId && c.filed <= date)) return true;
+    if (world.appeals.some(a => a.session && a.gameId === gameId && a.filed <= date)) return true;
+    return false;
+  }
+  function runTests(world, date, results) {
+    return world.games.filter(g => g.expected).map(g => {
+      const r = results[g.id];
+      const expected = expectedAt(g, date), actual = r.status;
+      return {
+        id: g.id, case: g.case, scenario: g.scenario, title: g.title, truth: g.truth, expected, actual,
+        pass: expected === actual, worst: g.truth === 'non-original' && PUBLIC.includes(actual),
+        overridden: sessionTouched(world, g.id, date), reasons: r.reasons,
+      };
+    });
+  }
+  function claimTests(world, S) {
+    return world.claims.filter(c => c.expectedBar !== undefined).map(c => {
+      const bar = claimBar(c, world, S);
+      return { id: c.id, case: c.case, claimant: c.claimant, target: world.byId[c.targetId].title, expected: c.expectedBar, actual: bar.ok, pass: c.expectedBar === bar.ok };
+    });
+  }
+  // Run the whole timeline day by day; return failing/worst-case runs collapsed into date ranges.
+  function sweep(world, S) {
+    const runs = [], open = {};
+    for (let d = world.sim.start; d <= world.sim.end; d = addDays(d, 1)) {
+      const tests = runTests(world, d, evaluateAll(world, d, S));
+      for (const t of tests) {
+        const bad = !t.overridden && (!t.pass || t.worst);
+        const key = bad ? `${t.expected}|${t.actual}|${t.worst}` : null;
+        const cur = open[t.id];
+        if (cur && cur.key === key) { cur.to = d; continue; }
+        if (cur) { runs.push(cur); delete open[t.id]; }
+        if (bad) open[t.id] = { key, id: t.id, case: t.case, title: t.title, from: d, to: d, expected: t.expected, actual: t.actual, worst: t.worst, pass: t.pass };
+      }
+    }
+    return runs.concat(Object.values(open)).sort((a, b) => (a.from < b.from ? -1 : 1));
+  }
+
+  // --- timeline helpers for UI ----------------------------------------------------------------
+  function partyEvents(g) {
+    const ev = [];
+    const pubDates = new Set((g.publicRecords || []).map(r => r.date));
+    (g.publicRecords || []).forEach(r => ev.push({ date: r.date, text: r.label, kind: 'public', url: r.url }));
+    if (g.dates.steamPageCreated) ev.push({ date: g.dates.steamPageCreated, text: 'Steam page created', kind: 'public' });
+    if (g.dates.release) ev.push({ date: g.dates.release, text: g.earlyAccess ? 'Released in Early Access' : 'Released on Steam', kind: 'public' });
+    if (g.removed) ev.push({ date: g.removed.date, text: 'Removed from Steam', kind: 'public' });
+    if (g.registration) {
+      ev.push({ date: g.registration.filed, text: 'Provenance registration filed', kind: 'system' });
+      for (const e of g.registration.evidence) {
+        if (e.verifiable && pubDates.has(e.date)) continue;
+        ev.push({ date: e.date, text: `${EVIDENCE_LABEL[e.type] || e.type}: ${e.label}`, kind: e.verifiable ? 'public' : 'self' });
+      }
+    }
+    return ev.sort((a, b) => (a.date < b.date ? -1 : 1));
+  }
+  function scriptedEvents(world) {
+    const ev = [];
+    for (const g of world.games) {
+      if (g.dates.steamPageCreated) ev.push({ date: g.dates.steamPageCreated, text: `${g.title}: Steam page created (auto-import)` });
+      if (g.dates.release) ev.push({ date: g.dates.release, text: `${g.title}: ${g.earlyAccess ? 'Early Access release' : 'release'}` });
+      if (g.registration) ev.push({ date: g.registration.filed, text: `${g.title}: developer registration filed` });
+      if (g.assetMatch) ev.push({ date: g.assetMatch.detected, text: `${g.title}: asset/code match detected` });
+      if (g.removed) ev.push({ date: g.removed.date, text: `${g.title}: removed from Steam` });
+      if (Array.isArray(g.copySignal)) g.copySignal.forEach(([d, v]) => ev.push({ date: d, text: `${g.title}: review copy-signal score → ${v}` }));
+      if (Array.isArray(g.reviews) && g.reviews.length > 2) ev.push({ date: g.reviews[g.reviews.length - 2][0], text: `${g.title}: ${g.reviews[g.reviews.length - 2][1]} reviews` });
+      (g.namesOriginal || []).forEach(n => ev.push({ date: n.from, text: `Reviews on ${g.title} begin naming ${(world.byId[n.id] || {}).title} as the original` }));
+    }
+    world.claims.forEach(c => ev.push({ date: c.filed, text: `Idea claim filed by ${c.claimant} → ${(world.byId[c.targetId] || {}).title}` }));
+    world.appeals.forEach(a => ev.push({ date: a.filed, text: `Appeal filed for ${(world.byId[a.gameId] || {}).title}` }));
+    world.log.forEach(e => ev.push({ date: e.date, text: `Moderator ${e.action.replace('_', ' ')}: ${e.triggerId}` }));
+    return ev.filter(e => e.date >= world.sim.start).sort((a, b) => (a.date < b.date ? -1 : 1));
+  }
+
+  return {
+    fmt, daysBetween, addDays, weekStart, reviewsAt, copySignalAt, buildWorld, isKnown, earliestPublic, earliestIndependent,
+    decisionIndex, finalDecision, annotations, registrationState, isPrerelease, claimBar, evaluateAll, expectedAt,
+    runTests, claimTests, sweep, partyEvents, scriptedEvents, triggerGameId, EVIDENCE_LABEL, PUBLIC,
+  };
+})();
+if (typeof module !== 'undefined') module.exports = { Engine, MOCK_DATA };
+</script>
+
+<!-- ======================================================================================
+     3. UI (React + Tailwind)
+     ====================================================================================== -->
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef, useEffect } = React;
+const M = MOCK_DATA, E = Engine, fmt = E.fmt;
+const AI_CATS = M.aiCategories;
+
+// ---------- small presentational pieces ----------
+const STATUS_STYLE = {
+  LISTED: 'bg-sky-900/60 text-sky-200 ring-sky-500/40',
+  VERIFIED: 'bg-emerald-900/60 text-emerald-200 ring-emerald-500/40',
+  NOT_YET_ELIGIBLE: 'bg-slate-700/60 text-slate-200 ring-slate-400/40',
+  HELD: 'bg-amber-900/50 text-amber-200 ring-amber-500/40',
+  QUEUED: 'bg-violet-900/60 text-violet-200 ring-violet-500/40',
+  REJECTED: 'bg-rose-900/50 text-rose-200 ring-rose-500/40',
+  ATTACHED: 'bg-zinc-700/60 text-zinc-200 ring-zinc-400/40',
+};
+function StatusPill({ s }) {
+  if (!s) return <span className="text-xs italic text-steam-dim">not in system</span>;
+  return <span className={`inline-block whitespace-nowrap rounded px-1.5 py-0.5 text-[11px] font-semibold tracking-wide ring-1 ${STATUS_STYLE[s]}`}>{s}</span>;
+}
+function VerifiedBadge({ small }) {
+  return (
+    <span title="Granted by a human moderator after the developer registered dated provenance evidence."
+      className={`inline-flex items-center gap-1 rounded bg-emerald-600 font-semibold text-white shadow ${small ? 'px-1.5 py-0.5 text-[10px]' : 'px-2.5 py-1 text-xs'}`}>
+      <svg viewBox="0 0 20 20" className={small ? 'h-3 w-3' : 'h-4 w-4'} fill="currentColor"><path d="M10 1l2.4 2.1 3.2-.2.6 3.1 2.6 1.9-1.3 2.9 1.3 2.9-2.6 1.9-.6 3.1-3.2-.2L10 21l-2.4-2.1-3.2.2-.6-3.1-2.6-1.9L2.5 11 1.2 8.1l2.6-1.9.6-3.1 3.2.2z" opacity=".35"/><path d="M8.6 13.4L5.5 10.3l1.2-1.2 1.9 1.9 4.7-4.7 1.2 1.2z"/></svg>
+      Verified Provenance
+    </span>
+  );
+}
+function Capsule({ g, className = '', label = true }) {
+  const [a, b] = g.colors || ['#334155', '#64748b'];
+  return (
+    <div className={`relative overflow-hidden rounded-sm ${className}`} style={{ background: `linear-gradient(135deg, ${a} 0%, ${b} 100%)` }}>
+      <div className="absolute inset-0 opacity-20" style={{ background: 'repeating-linear-gradient(45deg, transparent 0 12px, rgba(255,255,255,.25) 12px 13px)' }} />
+      {label && <div className="absolute inset-0 flex items-end p-2"><span className="text-sm font-extrabold leading-tight text-white drop-shadow-[0_1px_2px_rgba(0,0,0,.9)]">{g.title}</span></div>}
+    </div>
+  );
+}
+function reviewLabel(pct, n) {
+  if (!n) return { text: 'No user reviews', cls: 'text-steam-dim' };
+  if (n < 10) return { text: `${n} user reviews`, cls: 'text-steam-dim' };
+  if (pct >= 95 && n >= 500) return { text: 'Overwhelmingly Positive', cls: 'text-steam-accent' };
+  if (pct >= 80) return { text: n >= 50 ? 'Very Positive' : 'Positive', cls: 'text-steam-accent' };
+  if (pct >= 70) return { text: 'Mostly Positive', cls: 'text-steam-accent' };
+  if (pct >= 40) return { text: 'Mixed', cls: 'text-amber-300' };
+  if (pct >= 20) return { text: 'Mostly Negative', cls: 'text-rose-300' };
+  return { text: 'Negative', cls: 'text-rose-300' };
+}
+const AI_LEVEL = {
+  none: { text: 'None', cls: 'text-steam-dim' },
+  assisted: { text: 'Assisted (human-edited)', cls: 'text-sky-300' },
+  generated: { text: 'Generated', cls: 'text-fuchsia-300' },
+};
+const aiLevel = (g, k) => (g.ai && g.ai[k]) || 'none';
+const Section = ({ title, children, right }) => (
+  <section className="rounded bg-steam-panel/80 p-4 ring-1 ring-black/30">
+    <div className="mb-3 flex items-center justify-between gap-2"><h3 className="text-xs font-bold uppercase tracking-widest text-steam-accent">{title}</h3>{right}</div>
+    {children}
+  </section>
+);
+const Btn = ({ children, kind = 'default', className = '', ...p }) => {
+  const k = {
+    default: 'bg-steam-card hover:bg-steam-line text-steam-text',
+    primary: 'bg-gradient-to-r from-[#75b022] to-[#588a1b] text-white hover:brightness-110',
+    blue: 'bg-steam-accent/20 text-steam-accent hover:bg-steam-accent/30',
+    danger: 'bg-rose-800/70 text-rose-100 hover:bg-rose-700',
+    warn: 'bg-amber-800/60 text-amber-100 hover:bg-amber-700',
+  }[kind];
+  return <button {...p} className={`rounded px-3 py-1.5 text-sm transition disabled:cursor-not-allowed disabled:opacity-40 ${k} ${className}`}>{children}</button>;
+};
+const Field = ({ label, hint, children }) => (
+  <label className="block text-sm"><span className="mb-1 block text-steam-dim">{label}</span>{children}{hint && <span className="mt-1 block text-xs text-steam-dim/80">{hint}</span>}</label>
+);
+const MockLink = ({ href, children, className = '' }) => (
+  <a href={href} onClick={e => { e.preventDefault(); alertMock(href); }} className={className}>{children}</a>
+);
+let alertMock = () => {};
+
+// ---------- App ----------
+function App() {
+  const [date, _setDate] = useState(M.simulation.defaultDate);
+  const [settings, _setSettings] = useState({ ...M.settings });
+  const [session, _setSession] = useState({ log: [], games: [], claims: [], appeals: [], registrations: {} });
+  // Deep links: #moderation, #tests, #settings, #register, #claim, #game=<id> (internal preview)
+  const [route, setRoute] = useState(() => {
+    const [view, id] = location.hash.slice(1).split('=');
+    return view === 'game' ? { view, id, internal: true } : { view: view || 'browse' };
+  });
+  const [browse, setBrowse] = useState({ q: '', tags: [], verifiedOnly: false, noAI: [], sort: 'reviews' });
+  const [toast, setToast] = useState(null);
+  alertMock = href => { setToast(`Mock outbound link (not followed): ${href}`); setTimeout(() => setToast(null), 3500); };
+
+  const cause = useRef('initial load');
+  const setDate = d => { cause.current = 'date change'; _setDate(d); };
+  const setSettings = s => { cause.current = 'settings change'; _setSettings(s); };
+  const setSession = fn => { cause.current = 'session action'; _setSession(fn); };
+
+  const world = useMemo(() => E.buildWorld(M, session), [session]);
+  const run = useMemo(() => {
+    const t0 = performance.now();
+    const results = E.evaluateAll(world, date, settings);
+    const tests = E.runTests(world, date, results);
+    return { results, tests, ms: performance.now() - t0 };
+  }, [world, date, settings]);
+
+  // Track status changes and test pass/fail flips between engine runs.
+  const prev = useRef(null);
+  const [delta, setDelta] = useState({ changes: [], tests: {}, cause: '' });
+  useEffect(() => {
+    const p = prev.current;
+    if (p) {
+      const changes = world.games
+        .filter(g => (p.results[g.id] ? p.results[g.id].status : null) !== run.results[g.id].status)
+        .map(g => ({ id: g.id, title: g.title, from: p.results[g.id] ? p.results[g.id].status : null, to: run.results[g.id].status }));
+      const tests = {};
+      run.tests.forEach(t => { const pt = p.tests.find(x => x.id === t.id); if (pt && pt.pass !== t.pass) tests[t.id] = t.pass ? 'fixed' : 'broke'; });
+      setDelta({ changes, tests, cause: cause.current, at: Date.now() });
+    }
+    prev.current = { results: run.results, tests: run.tests };
+  }, [run]);
+
+  const act = (triggerId, action, extra = {}) =>
+    setSession(s => ({ ...s, log: [...s.log, { id: 's' + (s.log.length + 1), date, triggerId, action, by: 'you (session)', ...extra }] }));
+  const go = (view, extra = {}) => { setRoute({ view, ...extra }); window.scrollTo(0, 0); };
+  const ctx = { world, date, settings, results: run.results, tests: run.tests, go, act, session, setSession, setDate, setSettings, delta };
+
+  let page;
+  if (route.view === 'browse') page = <Browse {...ctx} f={browse} setF={setBrowse} />;
+  else if (route.view === 'game') page = <GamePage {...ctx} id={route.id} internal={route.internal} />;
+  else if (route.view === 'register') page = <RegisterFlow {...ctx} />;
+  else if (route.view === 'claim') page = <ClaimForm {...ctx} targetId={route.targetId} />;
+  else if (route.view === 'moderation') page = <Moderation {...ctx} />;
+  else if (route.view === 'settings') page = <SettingsPanel {...ctx} />;
+  else if (route.view === 'tests') page = <TestsPanel {...ctx} />;
+
+  return (
+    <div className="min-h-screen">
+      <Nav route={route} go={go} tests={run.tests} />
+      <SimBar {...ctx} ms={run.ms} />
+      <main className="mx-auto max-w-7xl px-4 py-6">{page}</main>
+      <footer className="mx-auto max-w-7xl px-4 pb-10 pt-4 text-xs text-steam-dim">
+        Firstmark lists a curated selection of games and does not sell anything. Every store button leads to Steam or the developer’s own store.
+        A game’s absence from Firstmark says nothing about it — we do not attempt to list every game. All games, studios and people on this page are fictional.
+      </footer>
+      {toast && <div className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded bg-black/90 px-4 py-2 text-sm text-white ring-1 ring-steam-accent/50">{toast}</div>}
+    </div>
+  );
+}
+
+function Nav({ route, go, tests }) {
+  const fails = tests.filter(t => !t.pass && !t.overridden).length;
+  const worst = tests.filter(t => t.worst).length;
+  const link = (v, label) => (
+    <button onClick={() => go(v)} className={`px-3 py-3 text-sm font-medium uppercase tracking-wide ${route.view === v ? 'border-b-2 border-steam-accent text-white' : 'border-b-2 border-transparent text-steam-text hover:text-white'}`}>{label}</button>
+  );
+  return (
+    <header className="border-b border-black/50 bg-steam-deep">
+      <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-1 px-4">
+        <button onClick={() => go('browse')} className="mr-4 py-3 text-lg font-black tracking-[.2em] text-white">FIRSTMARK<span className="ml-1 align-top text-[9px] font-normal tracking-normal text-steam-dim">prototype</span></button>
+        {link('browse', 'Store')}{link('register', 'Register a game')}{link('claim', 'Submit a claim')}
+        <span className="mx-2 hidden h-5 w-px bg-steam-line sm:block" />
+        <span className="text-[10px] uppercase tracking-widest text-amber-300/70">Internal</span>
+        {link('moderation', 'Moderation')}{link('settings', 'Settings')}
+        <button onClick={() => go('tests')} className={`flex items-center gap-2 px-3 py-3 text-sm font-medium uppercase tracking-wide ${route.view === 'tests' ? 'border-b-2 border-steam-accent text-white' : 'border-b-2 border-transparent hover:text-white'}`}>
+          Tests
+          <span className={`rounded px-1.5 text-[11px] ${worst ? 'bg-rose-600 text-white' : fails ? 'bg-amber-600 text-white' : 'bg-emerald-700 text-white'}`}>
+            {worst ? `${worst} worst-case` : fails ? `${fails} failing` : 'all pass'}
+          </span>
+        </button>
+      </div>
+    </header>
+  );
+}
+
+function SimBar({ date, setDate, world, delta, ms, results }) {
+  const { start, end, defaultDate } = M.simulation;
+  const total = E.daysBetween(start, end), cur = E.daysBetween(start, date);
+  const events = useMemo(() => E.scriptedEvents(world), [world]);
+  const upcoming = events.filter(e => e.date > date).slice(0, 3);
+  const clamp = d => (d < start ? start : d > end ? end : d);
+  const step = n => setDate(clamp(E.addDays(date, n)));
+  const known = world.games.filter(g => results[g.id].status).length;
+  return (
+    <div className="sticky top-0 z-40 border-b border-black/40 bg-[#101822]/95 backdrop-blur">
+      <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-4 gap-y-1 px-4 py-2 text-xs">
+        <span className="font-semibold uppercase tracking-widest text-amber-300/80">Simulation</span>
+        <span className="text-sm font-bold text-white">{fmt(date)}</span>
+        <div className="flex items-center gap-1">
+          {[-7, -1].map(n => <Btn key={n} className="!px-2 !py-0.5 text-xs" onClick={() => step(n)}>{n}d</Btn>)}
+          <input type="range" min={0} max={total} value={cur} onChange={e => setDate(E.addDays(start, +e.target.value))} className="w-40 sm:w-56" />
+          {[1, 7].map(n => <Btn key={n} className="!px-2 !py-0.5 text-xs" onClick={() => step(n)}>+{n}d</Btn>)}
+          <Btn className="!px-2 !py-0.5 text-xs" onClick={() => setDate(defaultDate)}>reset</Btn>
+        </div>
+        <span className="text-steam-dim">Engine re-ran on {known} records in {ms.toFixed(1)} ms</span>
+        {upcoming.length > 0 && (
+          <span className="text-steam-dim">Next: {upcoming.map((e, i) => <span key={i} className="mr-2"><button className="text-steam-accent hover:underline" onClick={() => setDate(e.date)}>{fmt(e.date)}</button> {e.text}</span>)}</span>
+        )}
+      </div>
+      {delta.changes.length > 0 && (
+        <div key={delta.at} className="mx-auto max-w-7xl px-4 pb-2 text-xs">
+          <span className="text-steam-dim">Status changes after {delta.cause}: </span>
+          {delta.changes.slice(0, 8).map(c => (
+            <span key={c.id} className="mr-3 whitespace-nowrap">{c.title} <StatusPill s={c.from} /> → <StatusPill s={c.to} /></span>
+          ))}
+          {delta.changes.length > 8 && <span className="text-steam-dim">+{delta.changes.length - 8} more</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- 1. Browse ----------
+function Browse({ world, results, date, go, f, setF }) {
+  const pub = world.games.filter(g => E.PUBLIC.includes(results[g.id].status));
+  const allTags = [...new Set(pub.flatMap(g => g.tags))].sort();
+  const set = patch => setF({ ...f, ...patch });
+  const toggle = (list, v) => (list.includes(v) ? list.filter(x => x !== v) : [...list, v]);
+  let shown = pub.filter(g =>
+    (!f.q || (g.title + ' ' + g.studio + ' ' + g.tags.join(' ')).toLowerCase().includes(f.q.toLowerCase())) &&
+    f.tags.every(t => g.tags.includes(t)) &&
+    (!f.verifiedOnly || results[g.id].status === 'VERIFIED') &&
+    f.noAI.every(k => aiLevel(g, k) === 'none'));
+  const sorters = {
+    reviews: (a, b) => E.reviewsAt(b, date) - E.reviewsAt(a, date),
+    release: (a, b) => (a.dates.release < b.dates.release ? 1 : -1),
+    name: (a, b) => a.title.localeCompare(b.title),
+  };
+  shown = shown.sort(sorters[f.sort]);
+  const featured = pub.filter(g => results[g.id].status === 'VERIFIED')[0];
+
+  return (
+    <div className="grid gap-6 lg:grid-cols-[1fr_260px]">
+      <div className="min-w-0 space-y-5">
+        {featured && (
+          <button onClick={() => go('game', { id: featured.id })} className="group grid w-full overflow-hidden rounded bg-steam-panel text-left shadow-lg ring-1 ring-black/40 sm:grid-cols-[1.6fr_1fr]">
+            <Capsule g={featured} className="aspect-[460/215] w-full" />
+            <div className="flex flex-col gap-2 p-4">
+              <div className="text-[10px] uppercase tracking-widest text-steam-dim">Featured original</div>
+              <div className="text-xl font-bold text-white group-hover:text-steam-accent">{featured.title}</div>
+              <VerifiedBadge small />
+              <p className="line-clamp-3 text-sm text-steam-text/90">{featured.desc}</p>
+              <div className="mt-auto flex flex-wrap gap-1">{featured.tags.map(t => <span key={t} className="rounded bg-steam-card px-1.5 text-[11px]">{t}</span>)}</div>
+            </div>
+          </button>
+        )}
+        <div className="flex flex-wrap items-center gap-3">
+          <input value={f.q} onChange={e => set({ q: e.target.value })} placeholder="Search titles, studios, tags" className="min-w-[200px] flex-1" />
+          <select value={f.sort} onChange={e => set({ sort: e.target.value })}>
+            <option value="reviews">Sort: most reviewed</option><option value="release">Sort: newest</option><option value="name">Sort: name</option>
+          </select>
+          <span className="text-sm text-steam-dim">{shown.length} of {pub.length} listed games</span>
+        </div>
+        {shown.length === 0 && <div className="rounded bg-steam-panel p-6 text-sm text-steam-dim">No listed games match these filters.</div>}
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          {shown.map(g => {
+            const n = E.reviewsAt(g, date), rl = reviewLabel(g.positivePct, n);
+            const used = AI_CATS.filter(c => aiLevel(g, c.key) !== 'none');
+            return (
+              <button key={g.id} onClick={() => go('game', { id: g.id })} className="group overflow-hidden rounded bg-steam-panel text-left shadow ring-1 ring-black/40 transition hover:-translate-y-0.5 hover:ring-steam-accent/50">
+                <Capsule g={g} className="aspect-[460/215] w-full" />
+                <div className="space-y-1.5 p-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="font-semibold text-white group-hover:text-steam-accent">{g.title}</div>
+                    {results[g.id].status === 'VERIFIED' && <VerifiedBadge small />}
+                  </div>
+                  <div className="text-xs text-steam-dim">{g.studio}</div>
+                  <div className={`text-xs ${rl.cls}`}>{rl.text} <span className="text-steam-dim">({n.toLocaleString()})</span></div>
+                  <div className="flex flex-wrap gap-1">{g.tags.slice(0, 3).map(t => <span key={t} className="rounded bg-steam-card px-1.5 text-[11px]">{t}</span>)}</div>
+                  <div className="text-[11px] text-steam-dim">
+                    AI: {used.length === 0 ? <span className="text-emerald-300">none disclosed in any category</span>
+                      : used.map(c => <span key={c.key} className={`mr-1.5 ${AI_LEVEL[aiLevel(g, c.key)].cls}`}>{c.label.split(' ')[0]}{aiLevel(g, c.key) === 'generated' ? '●' : '○'}</span>)}
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <aside className="space-y-4">
+        <Section title="Show">
+          <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={f.verifiedOnly} onChange={e => set({ verifiedOnly: e.target.checked })} /> <VerifiedBadge small /> only</label>
+        </Section>
+        <Section title="AI usage" right={f.noAI.length > 0 && <button className="text-xs text-steam-accent" onClick={() => set({ noAI: [] })}>clear</button>}>
+          <p className="mb-2 text-xs text-steam-dim">Tick a category to require <b>None</b> in it. Unticked categories allow any level.</p>
+          <div className="mb-2 flex flex-wrap gap-1">
+            <Btn className="!px-2 !py-0.5 text-[11px]" onClick={() => set({ noAI: AI_CATS.map(c => c.key) })}>No AI anywhere</Btn>
+            <Btn className="!px-2 !py-0.5 text-[11px]" onClick={() => set({ noAI: AI_CATS.map(c => c.key).filter(k => k !== 'code') })}>Allow AI code only</Btn>
+            <Btn className="!px-2 !py-0.5 text-[11px]" onClick={() => set({ noAI: ['art', 'voice'] })}>No AI art or voice</Btn>
+          </div>
+          {AI_CATS.map(c => (
+            <label key={c.key} className="flex items-center gap-2 py-0.5 text-sm">
+              <input type="checkbox" checked={f.noAI.includes(c.key)} onChange={() => set({ noAI: toggle(f.noAI, c.key) })} />
+              No AI in {c.label.toLowerCase()}
+            </label>
+          ))}
+        </Section>
+        <Section title="Tags" right={f.tags.length > 0 && <button className="text-xs text-steam-accent" onClick={() => set({ tags: [] })}>clear</button>}>
+          <div className="flex flex-wrap gap-1">
+            {allTags.map(t => (
+              <button key={t} onClick={() => set({ tags: toggle(f.tags, t) })} className={`rounded px-2 py-0.5 text-xs ${f.tags.includes(t) ? 'bg-steam-accent text-steam-deep' : 'bg-steam-card hover:bg-steam-line'}`}>{t}</button>
+            ))}
+          </div>
+        </Section>
+        <p className="px-1 text-xs text-steam-dim">Firstmark shows a curated subset. Not finding a game here says nothing about it.</p>
+      </aside>
+    </div>
+  );
+}
+
+// ---------- 2. Game page ----------
+function GamePage({ world, results, date, go, id, internal, settings }) {
+  const g = world.byId[id];
+  if (!g) return <div>Unknown game.</div>;
+  const r = results[g.id];
+  const isPublic = E.PUBLIC.includes(r.status);
+  const n = E.reviewsAt(g, date), rl = reviewLabel(g.positivePct, n);
+  const idx = E.decisionIndex(world, date);
+  const records = E.partyEvents(g).filter(e => e.date <= date && e.kind !== 'self' && e.kind !== 'system');
+  if (r.status === 'VERIFIED') {
+    records.push({ date: g.registration.filed, text: `Developer registered provenance (${g.registration.evidence.length} evidence items)`, kind: 'system' });
+    records.push({ date: r.verifiedOn, text: 'Provenance verified by a Firstmark moderator', kind: 'verified' });
+    records.sort((a, b) => (a.date < b.date ? -1 : 1));
+  }
+  const ideaClaims = world.claims.filter(c => c.targetId === g.id && (E.finalDecision(idx, 'claim:' + c.id) || {}).action === 'approve');
+  const dlc = world.games.filter(x => x.parentId === g.id && results[x.id].status === 'ATTACHED');
+
+  if (!isPublic && !internal) {
+    return <div className="rounded bg-steam-panel p-8 text-center text-steam-dim">This page isn’t available. <button className="text-steam-accent" onClick={() => go('browse')}>Back to the store</button></div>;
+  }
+  return (
+    <div className="space-y-5">
+      {!isPublic && (
+        <div className="rounded border border-amber-500/40 bg-amber-950/40 px-4 py-2 text-sm text-amber-200">
+          Internal preview — this record is not public (status <StatusPill s={r.status} />). Visitors see a neutral “page not available” message.
+          <button className="ml-3 text-steam-accent underline" onClick={() => go('moderation')}>Back to moderation</button>
+        </div>
+      )}
+      <div className="text-xs text-steam-dim"><button onClick={() => go('browse')} className="hover:text-white">Store</button> › {g.tags[0]} › {g.title}</div>
+      <div className="flex flex-wrap items-center gap-3">
+        <h1 className="text-3xl font-bold text-white">{g.title}</h1>
+        {r.status === 'VERIFIED' && <VerifiedBadge />}
+      </div>
+
+      <div className="grid gap-5 lg:grid-cols-[1.7fr_1fr]">
+        <div className="space-y-3">
+          <Capsule g={g} className="aspect-video w-full" label={false} />
+          <div className="grid grid-cols-4 gap-2">
+            {[0, 1, 2, 3].map(i => <div key={i} className="aspect-video rounded-sm opacity-80" style={{ background: `linear-gradient(${45 + i * 70}deg, ${g.colors[0]}, ${g.colors[1]})` }} />)}
+          </div>
+        </div>
+        <div className="space-y-3 rounded bg-black/20 p-4 text-sm">
+          <Capsule g={g} className="aspect-[460/215] w-full" />
+          <p className="text-steam-text/90">{g.desc}</p>
+          <dl className="grid grid-cols-[110px_1fr] gap-y-1 text-xs">
+            <dt className="text-steam-dim">ALL REVIEWS:</dt><dd className={rl.cls}>{rl.text} <span className="text-steam-dim">({n.toLocaleString()})</span></dd>
+            <dt className="text-steam-dim">RELEASE DATE:</dt><dd>{g.dates.release && g.dates.release <= date ? fmt(g.dates.release) + (g.earlyAccess ? ' (Early Access)' : '') : 'Not yet released'}</dd>
+            <dt className="text-steam-dim">DEVELOPER:</dt><dd className="text-steam-accent">{g.studio}</dd>
+          </dl>
+          <div className="flex flex-wrap gap-1">{g.tags.map(t => <span key={t} className="rounded bg-steam-card px-1.5 text-[11px]">{t}</span>)}</div>
+        </div>
+      </div>
+
+      <div className="grid gap-5 lg:grid-cols-[1.7fr_1fr]">
+        <div className="space-y-5">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded bg-gradient-to-r from-steam-card to-steam-panel p-4">
+            <div><div className="text-lg font-semibold text-white">Get {g.title}</div><div className="text-xs text-steam-dim">Firstmark doesn’t sell games. You’ll leave this site to buy.</div></div>
+            <div className="flex gap-2">
+              {g.links.steam && <MockLink href={g.links.steam} className="rounded bg-gradient-to-r from-[#75b022] to-[#588a1b] px-4 py-2 text-sm font-semibold text-white">View on Steam ↗</MockLink>}
+              {g.links.dev && <MockLink href={g.links.dev} className="rounded bg-steam-accent/20 px-4 py-2 text-sm font-semibold text-steam-accent">Developer’s store ↗</MockLink>}
+            </div>
+          </div>
+
+          {dlc.length > 0 && (
+            <Section title="Downloadable content">
+              {dlc.map(d => <div key={d.id} className="flex items-center gap-3 py-1 text-sm"><Capsule g={d} className="h-10 w-20" label={false} /><span className="text-white">{d.title}</span><MockLink href={d.links.steam} className="ml-auto text-xs text-steam-accent">Steam ↗</MockLink></div>)}
+            </Section>
+          )}
+
+          <Section title="Provenance timeline" right={<span className="text-[11px] text-steam-dim">dated public records only</span>}>
+            <ol className="relative ml-2 border-l border-steam-line">
+              {records.map((e, i) => (
+                <li key={i} className="mb-3 ml-4">
+                  <span className={`absolute -left-1.5 mt-1 h-3 w-3 rounded-full ${e.kind === 'verified' ? 'bg-emerald-500' : 'bg-steam-accent'}`} />
+                  <div className="text-xs text-steam-dim">{fmt(e.date)}</div>
+                  <div className={e.kind === 'verified' ? 'font-semibold text-emerald-300' : 'text-white'}>
+                    {e.url ? <MockLink href={e.url} className="hover:underline">{e.text} ↗</MockLink> : e.text}
+                  </div>
+                </li>
+              ))}
+            </ol>
+            {r.status !== 'VERIFIED' && <p className="text-xs text-steam-dim">The developer has not registered provenance for this game. That is common and implies nothing.</p>}
+          </Section>
+
+          {ideaClaims.map(c => (
+            <section key={c.id} className="rounded border-2 border-dashed border-amber-500/40 bg-amber-950/20 p-4">
+              <h3 className="mb-1 text-xs font-bold uppercase tracking-widest text-amber-300">Idea timeline (moderated, lower certainty)</h3>
+              <p className="mb-3 text-xs text-amber-100/70">A moderator confirmed the dates below. This states dates only. It makes no finding about how either game was made.</p>
+              <ul className="space-y-1 text-sm">
+                <li><b className="text-white">{c.claimant}</b> ({c.claimantProject}) publicly showed this concept on <b>{fmt(c.sourceDate)}</b>. <MockLink href={c.sourceLink} className="text-steam-accent">source ↗</MockLink></li>
+                <li><b className="text-white">{g.title}</b>’s Steam page was created on <b>{fmt(g.dates.steamPageCreated)}</b>.</li>
+              </ul>
+              <p className="mt-2 text-xs text-steam-dim">Overlapping elements noted: {c.overlaps.filter(o => o.kind === 'distinctive').map(o => o.text).join('; ')}.</p>
+            </section>
+          ))}
+
+          <Section title="Recent reviews">
+            {(g.reviewSamples || []).filter(rv => rv.signal !== 'copy').map((rv, i) => (
+              <div key={i} className="mb-2 rounded bg-black/20 p-3 text-sm"><div className="mb-1 text-xs text-steam-accent">{rv.author}</div>{rv.text}</div>
+            ))}
+            {!(g.reviewSamples || []).some(rv => rv.signal !== 'copy') && <div className="text-sm text-steam-dim">No reviews to show.</div>}
+          </Section>
+        </div>
+
+        <div className="space-y-5">
+          <Section title="AI usage disclosure">
+            <table className="w-full text-xs">
+              <tbody>
+                {AI_CATS.map(c => { const lv = aiLevel(g, c.key); return (
+                  <tr key={c.key} className="border-b border-steam-line/40"><td className="py-1 pr-2 text-steam-dim">{c.label}</td><td className={`py-1 text-right font-medium ${AI_LEVEL[lv].cls}`}>{AI_LEVEL[lv].text}</td></tr>
+                ); })}
+              </tbody>
+            </table>
+            <div className="mt-3 text-[11px] uppercase tracking-wide text-steam-dim">Source: {g.aiSource === 'developer' ? 'stated by the developer' : 'parsed from the Steam AI disclosure'}</div>
+            <blockquote className="mt-1 border-l-2 border-steam-line pl-2 text-xs italic text-steam-text/80">{g.aiQuote}</blockquote>
+          </Section>
+          {isPublic && (
+            <div className="rounded bg-steam-panel/60 p-3 text-xs text-steam-dim">
+              Did this game use a concept you showed publicly first? <button className="text-steam-accent hover:underline" onClick={() => go('claim', { targetId: g.id })}>Submit an idea claim</button> with a dated source. Claims are reviewed by people and only ever published as a factual timeline.
+            </div>
+          )}
+          {internal && <EngineChecks r={r} />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EngineChecks({ r }) {
+  return (
+    <Section title="Rules engine (internal)">
+      <div className="mb-2"><StatusPill s={r.status} /></div>
+      <ul className="mb-2 list-disc pl-4 text-xs">{r.reasons.map((x, i) => <li key={i}>{x}</li>)}</ul>
+      {r.checks && (
+        <table className="w-full text-xs">
+          <tbody>
+            {Object.values(r.checks).map(c => (
+              <tr key={c.label} className="border-t border-steam-line/40">
+                <td className="py-1 pr-1">{c.ok ? <span className="text-emerald-400">✓</span> : <span className="text-amber-400">✗</span>}</td>
+                <td className="py-1 pr-2 text-steam-dim">{c.label}{c.extra && <div className="text-[10px]">{c.extra}</div>}</td>
+                <td className="py-1 text-right">{String(c.value)} <span className="text-steam-dim">({c.need})</span></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {r.notes.length > 0 && <ul className="mt-2 list-disc pl-4 text-[11px] text-steam-dim">{r.notes.map((x, i) => <li key={i}>{x}</li>)}</ul>}
+    </Section>
+  );
+}
+
+// ---------- 3. Developer registration ----------
+const EVIDENCE_TYPES = Object.entries(E.EVIDENCE_LABEL);
+async function sha256(file) {
+  try {
+    const buf = await file.arrayBuffer();
+    const h = await crypto.subtle.digest('SHA-256', buf);
+    return 'sha256:' + [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, '0')).join('');
+  } catch (e) { return 'sha256:(unavailable in this browser context)'; }
+}
+function RegisterFlow({ world, results, date, go, setSession, settings }) {
+  const blank = { mode: 'new', existingId: '', title: '', studio: '', contact: '', prerelease: true, releaseDate: '', steamUrl: '', teaserUrl: '', teaserDate: '', tags: '', ai: {}, aiQuote: '', evidence: [{ type: 'build_hash', date: '', label: '', value: '', verifiable: false }] };
+  const [s, setS] = useState(blank);
+  const [step, setStep] = useState(1);
+  const [receipt, setReceipt] = useState(null);
+  const set = p => setS({ ...s, ...p });
+  const setEv = (i, p) => set({ evidence: s.evidence.map((e, j) => (j === i ? { ...e, ...p } : e)) });
+  const known = world.games.filter(g => results[g.id].status && g.kind === 'game' && !g.registration);
+
+  const submit = () => {
+    const evidence = s.evidence.filter(e => e.label || e.value).map(e => ({ ...e, date: e.date || date, verifiable: e.type === 'teaser' || e.type === 'devlog' ? !!e.value.startsWith('http') : e.verifiable }));
+    if (s.teaserUrl) evidence.push({ type: 'teaser', date: s.teaserDate || date, label: 'Teaser / first public showing', value: s.teaserUrl, verifiable: true });
+    const registration = { filed: date, by: s.contact || 'Session developer', evidence };
+    if (s.mode === 'existing' && s.existingId) {
+      setSession(x => ({ ...x, registrations: { ...x.registrations, [s.existingId]: registration } }));
+      setReceipt({ id: s.existingId, title: world.byId[s.existingId].title, filed: date, n: evidence.length });
+    } else {
+      const id = 'reg-' + Math.random().toString(36).slice(2, 7);
+      const hue = Math.floor(Math.random() * 360);
+      const g = {
+        id, case: null, scenario: 'Created in this session', title: s.title || 'Untitled project', studio: s.studio || 'Unnamed studio', kind: 'game',
+        tags: s.tags ? s.tags.split(',').map(t => t.trim()).filter(Boolean) : ['Indie'], colors: [`hsl(${hue} 50% 22%)`, `hsl(${(hue + 50) % 360} 70% 60%)`],
+        desc: 'Registered during this session.', links: { steam: s.steamUrl || null, dev: s.teaserUrl || null },
+        dates: { firstPublicRecord: s.teaserDate || null, steamPageCreated: s.steamUrl ? date : null, release: s.prerelease ? null : (s.releaseDate || date) },
+        publicRecords: s.teaserUrl ? [{ date: s.teaserDate || date, label: 'Teaser / first public showing', url: s.teaserUrl }] : [],
+        reviews: 0, copySignal: 0, registration, ai: s.ai, aiSource: 'developer', aiQuote: s.aiQuote || '(no statement provided)', truth: 'unknown', session: true,
+      };
+      setSession(x => ({ ...x, games: [...x.games, g] }));
+      setReceipt({ id, title: g.title, filed: date, n: evidence.length });
+    }
+    setStep(5);
+  };
+
+  const r = receipt && results[receipt.id];
+  const steps = ['Game', 'Evidence', 'AI disclosure', 'Review'];
+  return (
+    <div className="mx-auto max-w-3xl space-y-4">
+      <h1 className="text-2xl font-bold text-white">Register a game</h1>
+      <p className="text-sm text-steam-dim">Registering creates a dated provenance record. You can register before you have a Steam page. A moderator reviews every registration; only a moderator can grant Verified Provenance.</p>
+      <div className="flex gap-1 text-xs">{steps.map((t, i) => <div key={t} className={`flex-1 rounded px-2 py-1 text-center ${step === i + 1 ? 'bg-steam-accent text-steam-deep' : step > i + 1 ? 'bg-steam-card text-white' : 'bg-steam-panel text-steam-dim'}`}>{i + 1}. {t}</div>)}</div>
+
+      {step === 1 && (
+        <Section title="About the game">
+          <div className="mb-3 flex gap-4 text-sm">
+            <label className="flex items-center gap-2"><input type="radio" checked={s.mode === 'new'} onChange={() => set({ mode: 'new' })} /> New record (incl. pre-release)</label>
+            <label className="flex items-center gap-2"><input type="radio" checked={s.mode === 'existing'} onChange={() => set({ mode: 'existing' })} /> Claim a game already imported from Steam</label>
+          </div>
+          {s.mode === 'existing' ? (
+            <Field label="Game" hint="Shows every imported record without a registration, including ones that aren’t public. A real site would verify Steam ownership first (e.g. via Steamworks).">
+              <select value={s.existingId} onChange={e => set({ existingId: e.target.value })} className="w-full">
+                <option value="">Choose…</option>
+                {known.map(g => <option key={g.id} value={g.id}>{g.title} — {g.studio}</option>)}
+              </select>
+            </Field>
+          ) : (
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Title"><input className="w-full" value={s.title} onChange={e => set({ title: e.target.value })} /></Field>
+              <Field label="Studio"><input className="w-full" value={s.studio} onChange={e => set({ studio: e.target.value })} /></Field>
+              <Field label="Tags (comma separated)"><input className="w-full" value={s.tags} onChange={e => set({ tags: e.target.value })} /></Field>
+              <Field label="Release status">
+                <select className="w-full" value={s.prerelease ? 'pre' : 'rel'} onChange={e => set({ prerelease: e.target.value === 'pre' })}>
+                  <option value="pre">Pre-release (no release yet)</option><option value="rel">Released</option>
+                </select>
+              </Field>
+              {!s.prerelease && <Field label="Release date"><input type="date" className="w-full" value={s.releaseDate} onChange={e => set({ releaseDate: e.target.value })} /></Field>}
+              <Field label="Steam page URL (optional)"><input className="w-full" value={s.steamUrl} onChange={e => set({ steamUrl: e.target.value })} placeholder="https://store.steampowered.com/app/…" /></Field>
+              <Field label="First public showing (teaser, post, trailer)"><input className="w-full" value={s.teaserUrl} onChange={e => set({ teaserUrl: e.target.value })} placeholder="https://…" /></Field>
+              <Field label="Date of that showing"><input type="date" className="w-full" value={s.teaserDate} onChange={e => set({ teaserDate: e.target.value })} /></Field>
+            </div>
+          )}
+          <div className="mt-3"><Field label="Contact (name / email)"><input className="w-full" value={s.contact} onChange={e => set({ contact: e.target.value })} /></Field></div>
+          <div className="mt-4 text-right"><Btn kind="primary" disabled={s.mode === 'existing' ? !s.existingId : !s.title} onClick={() => setStep(2)}>Next</Btn></div>
+        </Section>
+      )}
+
+      {step === 2 && (
+        <Section title="Evidence">
+          <p className="mb-3 text-xs text-steam-dim">Build hashes are computed in your browser. Files never leave your machine in this prototype. Public links (teasers, devlogs) count as independently dated. Hashes, concept art and git history count as self-reported dates.</p>
+          {s.evidence.map((e, i) => (
+            <div key={i} className="mb-2 grid gap-2 rounded bg-black/20 p-2 sm:grid-cols-[130px_130px_1fr_1fr_auto]">
+              <select value={e.type} onChange={x => setEv(i, { type: x.target.value })}>{EVIDENCE_TYPES.map(([k, v]) => <option key={k} value={k}>{v}</option>)}</select>
+              <input type="date" value={e.date} onChange={x => setEv(i, { date: x.target.value })} />
+              <input placeholder="Label" value={e.label} onChange={x => setEv(i, { label: x.target.value })} />
+              <div className="flex gap-1">
+                <input className="min-w-0 flex-1" placeholder="Link, hash or commit" value={e.value} onChange={x => setEv(i, { value: x.target.value })} />
+                {(e.type === 'build_hash' || e.type === 'concept_art' || e.type === 'document') && (
+                  <label className="cursor-pointer rounded bg-steam-card px-2 py-1 text-xs">hash file<input type="file" className="hidden" onChange={async x => { const f = x.target.files[0]; if (f) setEv(i, { value: await sha256(f), label: e.label || f.name }); }} /></label>
+                )}
+              </div>
+              <button className="text-xs text-rose-300" onClick={() => set({ evidence: s.evidence.filter((_, j) => j !== i) })}>remove</button>
+            </div>
+          ))}
+          <Btn onClick={() => set({ evidence: [...s.evidence, { type: 'git', date: '', label: '', value: '', verifiable: false }] })}>+ Add evidence</Btn>
+          <div className="mt-4 flex justify-between"><Btn onClick={() => setStep(1)}>Back</Btn><Btn kind="primary" onClick={() => setStep(3)}>Next</Btn></div>
+        </Section>
+      )}
+
+      {step === 3 && (
+        <Section title="AI usage (developer-stated)">
+          <div className="grid gap-x-6 gap-y-1 sm:grid-cols-2">
+            {AI_CATS.map(c => (
+              <div key={c.key} className="flex items-center justify-between gap-2 text-sm">
+                <span>{c.label}</span>
+                <select value={s.ai[c.key] || 'none'} onChange={e => set({ ai: { ...s.ai, [c.key]: e.target.value === 'none' ? undefined : e.target.value } })}>
+                  <option value="none">None</option><option value="assisted">Assisted (human-edited)</option><option value="generated">Generated</option>
+                </select>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3"><Field label="Short disclosure statement (shown on the game page)"><textarea className="w-full" rows={2} value={s.aiQuote} onChange={e => set({ aiQuote: e.target.value })} /></Field></div>
+          <div className="mt-4 flex justify-between"><Btn onClick={() => setStep(2)}>Back</Btn><Btn kind="primary" onClick={() => setStep(4)}>Next</Btn></div>
+        </Section>
+      )}
+
+      {step === 4 && (
+        <Section title="Review & submit">
+          <ul className="space-y-1 text-sm">
+            <li><span className="text-steam-dim">Game:</span> {s.mode === 'existing' ? (world.byId[s.existingId] || {}).title : s.title} {s.mode === 'new' && s.prerelease && <span className="ml-1 rounded bg-violet-800 px-1 text-[11px]">pre-release</span>}</li>
+            <li><span className="text-steam-dim">Evidence items:</span> {s.evidence.filter(e => e.label || e.value).length + (s.teaserUrl ? 1 : 0)}</li>
+            <li><span className="text-steam-dim">Record date:</span> {fmt(date)} (the simulated “today”)</li>
+          </ul>
+          <p className="mt-3 text-xs text-steam-dim">By submitting you confirm you made this game or hold rights to it. Submitting material that isn’t yours can lead to rejection of the record.</p>
+          <div className="mt-4 flex justify-between"><Btn onClick={() => setStep(3)}>Back</Btn><Btn kind="primary" onClick={submit}>Submit registration</Btn></div>
+        </Section>
+      )}
+
+      {step === 5 && receipt && (
+        <Section title="Provenance record created">
+          <p className="text-sm">Record <code className="rounded bg-black/40 px-1">{receipt.id}</code> for <b className="text-white">{receipt.title}</b> was filed on <b>{fmt(receipt.filed)}</b> with {receipt.n} evidence items.</p>
+          <p className="mt-2 text-sm">Rules engine routing: <StatusPill s={r && r.status} /> {r && r.priority && <span className="text-steam-dim">priority {r.priority}</span>}</p>
+          <ul className="mt-1 list-disc pl-5 text-xs text-steam-dim">{r && r.reasons.map((x, i) => <li key={i}>{x}</li>)}</ul>
+          <div className="mt-4 flex gap-2"><Btn kind="blue" onClick={() => go('moderation')}>Open moderation queue</Btn><Btn onClick={() => { setS(blank); setStep(1); setReceipt(null); }}>Register another</Btn></div>
+        </Section>
+      )}
+    </div>
+  );
+}
+
+// ---------- 4. Claim submission ----------
+function ClaimForm({ world, results, date, go, setSession, settings, targetId }) {
+  const pub = world.games.filter(g => E.PUBLIC.includes(results[g.id].status));
+  const blank = { targetId: targetId || '', claimant: '', claimantProject: '', concept: '', sourceLink: '', sourceDate: '', overlaps: [{ text: '', kind: 'distinctive' }], confirm: false };
+  const [c, setC] = useState(blank);
+  const [done, setDone] = useState(null);
+  const set = p => setC({ ...c, ...p });
+  const draft = { ...c, id: 'draft', filed: date };
+  const bar = c.targetId ? E.claimBar(draft, world, settings) : null;
+
+  const submit = () => {
+    const claim = { ...c, id: 'c-s' + Math.random().toString(36).slice(2, 6), filed: date, session: true, overlaps: c.overlaps.filter(o => o.text.trim()) };
+    setSession(x => ({ ...x, claims: [...x.claims, claim] }));
+    setDone({ claim, bar: E.claimBar(claim, world, settings) });
+  };
+
+  if (done) return (
+    <div className="mx-auto max-w-2xl">
+      <Section title="Claim received">
+        <p className="text-sm">Thank you. Your claim about <b className="text-white">{world.byId[done.claim.targetId].title}</b> was recorded on {fmt(done.claim.filed)}.</p>
+        {done.bar.ok
+          ? <p className="mt-2 text-sm">It meets the evidence bar and has gone to a moderator. Both parties may be contacted. If the claim is upheld, it is published only as a dated timeline.</p>
+          : <p className="mt-2 text-sm">It doesn’t yet meet the evidence bar, so the listing is unchanged. You can file again with a dated public source that predates the game and a specific, distinctive overlap.</p>}
+        <ul className="mt-2 text-xs">{done.bar.checks.map((k, i) => <li key={i}>{k.ok ? '✓' : '✗'} {k.label}</li>)}</ul>
+        <div className="mt-4 flex gap-2"><Btn kind="blue" onClick={() => go('moderation')}>Open moderation (internal)</Btn><Btn onClick={() => { setC(blank); setDone(null); }}>File another</Btn></div>
+      </Section>
+    </div>
+  );
+
+  return (
+    <div className="mx-auto grid max-w-5xl gap-5 lg:grid-cols-[1.5fr_1fr]">
+      <div className="space-y-4">
+        <h1 className="text-2xl font-bold text-white">Submit an idea claim</h1>
+        <p className="text-sm text-steam-dim">For when a listed game appears to use a concept you showed publicly first. Claims are reviewed by people. If upheld, Firstmark publishes only a factual, dated timeline. It never publishes a verdict.</p>
+        <Section title="The game">
+          <Field label="Listed game"><select className="w-full" value={c.targetId} onChange={e => set({ targetId: e.target.value })}><option value="">Choose…</option>{pub.map(g => <option key={g.id} value={g.id}>{g.title} — {g.studio}</option>)}</select></Field>
+        </Section>
+        <Section title="You and your concept">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label="Your name"><input className="w-full" value={c.claimant} onChange={e => set({ claimant: e.target.value })} /></Field>
+            <Field label="Your project"><input className="w-full" value={c.claimantProject} onChange={e => set({ claimantProject: e.target.value })} /></Field>
+          </div>
+          <div className="mt-3"><Field label="Describe the concept"><textarea rows={2} className="w-full" value={c.concept} onChange={e => set({ concept: e.target.value })} /></Field></div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-[1fr_170px]">
+            <Field label="Public source link" hint="A post, video or page that shows the concept and carries a date."><input className="w-full" value={c.sourceLink} onChange={e => set({ sourceLink: e.target.value })} placeholder="https://…" /></Field>
+            <Field label="Date of that source"><input type="date" className="w-full" value={c.sourceDate} onChange={e => set({ sourceDate: e.target.value })} /></Field>
+          </div>
+        </Section>
+        <Section title="What overlaps?">
+          <p className="mb-2 text-xs text-steam-dim">List concrete elements. Genre and common mechanics (“a roguelike deckbuilder”, “has crafting”) don’t meet the bar on their own.</p>
+          {c.overlaps.map((o, i) => (
+            <div key={i} className="mb-2 flex gap-2">
+              <input className="flex-1" value={o.text} onChange={e => set({ overlaps: c.overlaps.map((x, j) => (j === i ? { ...x, text: e.target.value } : x)) })} placeholder="e.g. letters are burned as fuel for the cart" />
+              <select value={o.kind} onChange={e => set({ overlaps: c.overlaps.map((x, j) => (j === i ? { ...x, kind: e.target.value } : x)) })}>
+                <option value="distinctive">Specific & distinctive</option><option value="genre">Genre / common mechanic</option>
+              </select>
+            </div>
+          ))}
+          <Btn onClick={() => set({ overlaps: [...c.overlaps, { text: '', kind: 'distinctive' }] })}>+ Add overlap</Btn>
+        </Section>
+        <label className="flex items-start gap-2 text-sm"><input type="checkbox" className="mt-1" checked={c.confirm} onChange={e => set({ confirm: e.target.checked })} /> I understand the developer of this game may be shown my claim and given a chance to respond.</label>
+        <Btn kind="primary" disabled={!c.targetId || !c.claimant || !c.confirm} onClick={submit}>Submit claim</Btn>
+      </div>
+      <div className="lg:pt-12">
+        <Section title="Evidence bar (live)">
+          {!bar ? <p className="text-sm text-steam-dim">Choose a game to see the checks.</p> : (
+            <>
+              <ul className="space-y-2 text-sm">{bar.checks.map((k, i) => <li key={i} className="flex gap-2"><span className={k.ok ? 'text-emerald-400' : 'text-amber-400'}>{k.ok ? '✓' : '✗'}</span><span>{k.label}</span></li>)}</ul>
+              <div className={`mt-3 rounded p-2 text-sm ${bar.ok ? 'bg-emerald-900/40 text-emerald-200' : 'bg-amber-900/30 text-amber-200'}`}>
+                {bar.ok ? 'Meets the bar: will go to a moderator.' : 'Below the bar: will be recorded, but the listing stays unchanged.'}
+              </div>
+            </>
+          )}
+        </Section>
+      </div>
+    </div>
+  );
+}
+
+// ---------- 5. Moderation ----------
+const ACTIONS = {
+  registration: { approve: 'Approve → grant Verified Provenance', reject: 'Reject registration (record hidden; developer may appeal)' },
+  asset: { approve: 'Approve → match is legitimate (e.g. shared pack); resume normal rules', reject: 'Reject record (internal reason required)' },
+  claim: { approve: 'Approve → uphold claim; publish the dated idea timeline', reject: 'Reject → dismiss claim; nothing is published' },
+  appeal: { approve: 'Approve → accept appeal; lift prior decision', reject: 'Reject → deny appeal; record stays hidden' },
+};
+
+function Moderation(props) {
+  const { world, results, date, settings, setSettings } = props;
+  const [tab, setTab] = useState('queue');
+  const of = s => world.games.filter(g => results[g.id].status === s);
+  const queue = of('QUEUED').sort((a, b) => results[b.id].priority - results[a.id].priority || (results[a.id].since < results[b.id].since ? -1 : 1));
+  const ws = E.weekStart(date);
+  const used = world.log.filter(e => e.date >= ws && e.date <= date && ['approve', 'reject', 'clear', 'request_info'].includes(e.action)).length;
+  const cap = settings.WEEKLY_CAPACITY;
+  const appeals = world.appeals.filter(a => a.filed <= date);
+  const claims = world.claims.filter(c => c.filed <= date);
+  const tabs = [
+    ['queue', `Queue (${queue.length})`], ['held', `Held (${of('HELD').length})`], ['nye', `Not yet eligible (${of('NOT_YET_ELIGIBLE').length})`],
+    ['rejected', `Rejected (${of('REJECTED').length})`], ['appeals', `Appeals (${appeals.length})`], ['claims', `Claims (${claims.length})`], ['log', 'Decision log'],
+  ];
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-white">Moderation</h1>
+          <p className="text-sm text-steam-dim">Automation collects facts and routes records. Only people make decisions here.</p>
+        </div>
+        <div className="w-72 rounded bg-steam-panel p-3 text-xs ring-1 ring-black/30">
+          <div className="mb-1 flex justify-between"><span className="text-steam-dim">Weekly capacity (week of {fmt(ws)})</span><span className={used >= cap ? 'text-rose-300' : 'text-white'}>{used} / {cap}</span></div>
+          <div className="h-2 overflow-hidden rounded bg-black/40"><div className={`h-full ${used >= cap ? 'bg-rose-500' : 'bg-steam-accent'}`} style={{ width: `${Math.min(100, (used / cap) * 100)}%` }} /></div>
+          <div className="mt-2 flex items-center justify-between gap-2">
+            <span className="text-steam-dim">Cap</span>
+            <input type="number" min={1} value={cap} onChange={e => setSettings({ ...settings, WEEKLY_CAPACITY: Math.max(1, +e.target.value) })} className="w-16" />
+          </div>
+          {queue.length > cap - used && <div className="mt-1 text-amber-300">Queue ({queue.length}) exceeds remaining capacity ({Math.max(0, cap - used)}).</div>}
+        </div>
+      </div>
+      <div className="flex flex-wrap gap-1 border-b border-steam-line">
+        {tabs.map(([k, l]) => <button key={k} onClick={() => setTab(k)} className={`rounded-t px-3 py-1.5 text-sm ${tab === k ? 'bg-steam-panel text-white' : 'text-steam-dim hover:text-white'}`}>{l}</button>)}
+      </div>
+      {tab === 'queue' && (queue.length ? queue.map((g, i) => <QueueItem key={g.id} g={g} rank={i} {...props} />) : <Empty>Nothing is waiting for a decision.</Empty>)}
+      {tab === 'held' && <HeldList list={of('HELD')} {...props} />}
+      {tab === 'nye' && <NyeList list={of('NOT_YET_ELIGIBLE')} {...props} />}
+      {tab === 'rejected' && <RejectedList list={of('REJECTED')} {...props} />}
+      {tab === 'appeals' && <AppealsList appeals={appeals} {...props} />}
+      {tab === 'claims' && <ClaimsList claims={claims} {...props} />}
+      {tab === 'log' && <LogList {...props} />}
+    </div>
+  );
+}
+const Empty = ({ children }) => <div className="rounded bg-steam-panel p-6 text-sm text-steam-dim">{children}</div>;
+
+function RowHead({ g, r, go, right, onToggle }) {
+  return (
+    <div className="flex cursor-pointer flex-wrap items-center gap-3 p-3" onClick={onToggle}>
+      <Capsule g={g} className="h-11 w-24 shrink-0" label={false} />
+      <div className="min-w-0 flex-1">
+        <div className="font-semibold text-white">{g.title} <span className="font-normal text-steam-dim">· {g.studio}</span> {g.case && <span className="ml-1 rounded bg-black/40 px-1 text-[10px] text-steam-dim">case {g.case}</span>}</div>
+        <div className="mt-0.5 text-xs text-steam-dim">{r.reasons.join(' · ')}</div>
+      </div>
+      {right}
+      <button className="text-xs text-steam-accent hover:underline" onClick={e => { e.stopPropagation(); go('game', { id: g.id, internal: true }); }}>preview page</button>
+    </div>
+  );
+}
+
+function QueueItem(props) {
+  const { g, results, date, rank, go } = props;
+  const r = results[g.id];
+  const [open, setOpen] = useState(rank < 1);
+  return (
+    <div className="rounded bg-steam-panel ring-1 ring-black/40">
+      <div className="flex items-center">
+        <div className="w-16 shrink-0 text-center"><div className="text-2xl font-black text-violet-300">{r.priority}</div><div className="text-[9px] uppercase text-steam-dim">priority</div></div>
+        <div className="flex-1">
+          <RowHead g={g} r={r} go={go} onToggle={() => setOpen(!open)}
+            right={<div className="text-right text-xs text-steam-dim">waiting since {fmt(r.since)}<br />{E.daysBetween(r.since, date)} days</div>} />
+        </div>
+      </div>
+      {open && (
+        <div className="space-y-4 border-t border-steam-line p-4">
+          <EvidenceSummary {...props} r={r} />
+          {r.triggers.map(t => <TriggerActions key={t.id} t={t} {...props} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TriggerActions({ t, g, world, date, act, settings }) {
+  const [note, setNote] = useState('');
+  const idx = E.decisionIndex(world, date);
+  const ann = E.annotations(idx, t.id);
+  const help = ACTIONS[t.type];
+  let accused = [];
+  if (t.type === 'asset' || t.type === 'claim') accused = [g.studio];
+  if (t.type === 'registration') accused = world.similarity.filter(p => (p.a === g.id || p.b === g.id)).map(p => world.byId[p.a === g.id ? p.b : p.a]).filter(o => o && E.isKnown(o, date)).map(o => o.studio);
+  return (
+    <div className="rounded border border-violet-500/30 bg-violet-950/20 p-3">
+      <div className="mb-2 flex flex-wrap items-center gap-2 text-sm"><span className="rounded bg-violet-800 px-1.5 text-xs text-white">{t.type}</span><b className="text-white">{t.label}</b><span className="text-xs text-steam-dim">priority {t.priority} · since {fmt(t.since)}</span></div>
+      {ann.length > 0 && (
+        <ul className="mb-2 text-xs text-steam-dim">
+          {ann.map((a, i) => <li key={i}>• {fmt(a.date)} — {a.action === 'notify' ? `Right of response sent; reply due ${fmt(E.addDays(a.date, settings.RESPONSE_WINDOW_DAYS))}` : 'More info requested'} {a.note && `(${a.note})`} <span className="opacity-60">— {a.by}</span></li>)}
+        </ul>
+      )}
+      <ul className="mb-2 text-xs text-steam-dim"><li>Approve: {help.approve.replace(/^Approve → /, '')}</li><li>Reject: {help.reject.replace(/^Reject → /, '')}</li></ul>
+      <div className="flex flex-wrap items-center gap-2">
+        <input className="min-w-[220px] flex-1 text-sm" placeholder="Note / internal reason (stored, never shown publicly)" value={note} onChange={e => setNote(e.target.value)} />
+        <Btn kind="primary" onClick={() => act(t.id, 'approve', { note })}>Approve</Btn>
+        <Btn kind="danger" disabled={!note.trim()} title="An internal reason is required" onClick={() => act(t.id, 'reject', { note, internalReason: note })}>Reject</Btn>
+        <Btn kind="warn" onClick={() => act(t.id, 'request_info', { note })}>Request info</Btn>
+        <Btn kind="blue" disabled={!accused.length} onClick={() => act(t.id, 'notify', { note: `Notified ${accused.join(', ')}` })}>Notify accused</Btn>
+      </div>
+      {accused.length > 0 && <div className="mt-1 text-[11px] text-steam-dim">Right of response would go to: {accused.join(', ')}</div>}
+    </div>
+  );
+}
+
+function EvidenceSummary({ g, r, world, results, date, settings }) {
+  const PARTY_COLORS = ['#66c0f4', '#f0abfc', '#fcd34d', '#86efac'];
+  const partyIds = [g.id, ...r.similar.filter(p => p.score >= 0.5).map(p => p.other)];
+  if (g.assetMatch) partyIds.push(g.assetMatch.against);
+  const uniq = [...new Set(partyIds)].slice(0, 4);
+  const parties = uniq.map((id, i) => ({ key: id, name: world.byId[id].title + (id === g.id ? ' (this record)' : ''), color: PARTY_COLORS[i], events: E.partyEvents(world.byId[id]) }));
+  const claims = world.claims.filter(c => c.targetId === g.id && c.filed <= date);
+  claims.forEach((c, i) => parties.push({ key: c.id, name: `${c.claimant} (claimant)`, color: '#fb923c', events: [{ date: c.sourceDate, text: 'Concept shown publicly (source link)', kind: 'public' }, { date: c.filed, text: 'Idea claim filed', kind: 'system' }] }));
+  const quoted = [
+    ...(g.reviewSamples || []).filter(rv => rv.signal === 'copy').map(rv => ({ ...rv, on: g.title })),
+    ...world.games.filter(h => (h.namesOriginal || []).some(n => n.id === g.id && n.from <= date)).flatMap(h => (h.reviewSamples || []).filter(rv => rv.signal === 'copy').map(rv => ({ ...rv, on: h.title }))),
+  ];
+  const myIndep = E.earliestIndependent(g) || (g.registration && g.registration.filed);
+  const earlier = r.similar.filter(p => p.score >= settings.SIMILARITY_THRESHOLD).map(p => world.byId[p.other]).filter(o => { const d = E.earliestPublic(o); return d && myIndep && d < myIndep; });
+
+  return (
+    <div className="space-y-4">
+      {earlier.map(o => (
+        <div key={o.id} className="rounded border border-sky-400/40 bg-sky-950/40 p-2 text-sm text-sky-100">
+          “{o.title}” ({o.studio}) has a public record dated <b>{fmt(E.earliestPublic(o))}</b>, earlier than this record’s earliest independently dated evidence ({fmt(myIndep)}). The material overlaps (similarity {r.similar.find(p => p.other === o.id).score.toFixed(2)}).
+        </div>
+      ))}
+      <div className="grid gap-4 xl:grid-cols-[1.4fr_1fr]">
+        <div>
+          <h4 className="mb-1 text-xs font-bold uppercase tracking-widest text-steam-dim">Side-by-side timelines</h4>
+          <SideBySide parties={parties} date={date} />
+          <div className="mt-1 text-[10px] text-steam-dim">Blue = public & independently dated · amber = self-reported date · grey = system event</div>
+        </div>
+        <div className="space-y-3">
+          {r.checks && <MiniChecks checks={r.checks} />}
+          {r.notes.length > 0 && <ul className="list-disc pl-4 text-xs text-steam-dim">{r.notes.map((n, i) => <li key={i}>{n}</li>)}</ul>}
+        </div>
+      </div>
+
+      {r.similar.length > 0 && (
+        <div>
+          <h4 className="mb-1 text-xs font-bold uppercase tracking-widest text-steam-dim">Similarity scores</h4>
+          <table className="w-full text-xs">
+            <thead className="text-steam-dim"><tr><th className="text-left">Other record</th><th>Title</th><th>Description</th><th>Screenshots</th><th>Keywords</th><th>Max</th><th>Counts?</th></tr></thead>
+            <tbody>{r.similar.map(p => (
+              <tr key={p.other} className="border-t border-steam-line/40 text-center">
+                <td className="py-1 text-left text-white">{world.byId[p.other].title} <StatusPill s={results[p.other].status} /></td>
+                {['title', 'description', 'screenshots', 'keywords'].map(k => <td key={k} className={p[k] >= settings.SIMILARITY_THRESHOLD ? 'font-bold text-amber-300' : ''}>{p[k].toFixed(2)}</td>)}
+                <td className="font-bold">{p.score.toFixed(2)}</td>
+                <td className="text-[10px] text-steam-dim">{p.otherInR ? 'listed/registered' : 'no (partner not listed/registered)'}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+          <div className="mt-3 flex flex-wrap gap-4">
+            {r.similar.filter(p => p.screenshots >= 0.5).map(p => {
+              const o = world.byId[p.other];
+              return (
+                <div key={p.other} className="text-xs">
+                  <div className="flex gap-1"><Capsule g={g} className="h-14 w-24" label={false} /><Capsule g={o} className="h-14 w-24" label={false} /></div>
+                  <div className="mt-1 text-steam-dim">Matched screenshots: {g.title} ↔ {o.title} · <b className="text-white">{p.screenshots.toFixed(2)}</b></div>
+                  {p.note && <div className="text-steam-dim">{p.note}</div>}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {g.assetMatch && g.assetMatch.detected <= date && (
+        <div className="rounded bg-black/20 p-3 text-sm">
+          <h4 className="mb-1 text-xs font-bold uppercase tracking-widest text-steam-dim">Asset / code match vs registered build of “{world.byId[g.assetMatch.against].title}” · score {g.assetMatch.score.toFixed(2)}</h4>
+          <ul className="list-disc pl-5 text-xs">{g.assetMatch.details.map((d, i) => <li key={i}>{d}</li>)}</ul>
+          {g.assetMatch.sharedPack && <div className="mt-2 rounded bg-emerald-900/30 p-2 text-xs text-emerald-200">Shared-pack check: all matched assets also appear in “{g.assetMatch.sharedPack.name}” ({g.assetMatch.sharedPack.vendor}, published {fmt(g.assetMatch.sharedPack.published)}). Likely legitimate.</div>}
+          {!g.assetMatch.sharedPack && <div className="mt-2 text-xs text-steam-dim">Shared-pack check: no matching public asset-store pack or engine template found.</div>}
+        </div>
+      )}
+
+      {g.registration && g.registration.filed <= date && (
+        <div>
+          <h4 className="mb-1 text-xs font-bold uppercase tracking-widest text-steam-dim">Registration evidence ({g.registration.by}, filed {fmt(g.registration.filed)}){E.isPrerelease(g) && ' · pre-release'}</h4>
+          <table className="w-full text-xs"><tbody>{g.registration.evidence.map((e, i) => (
+            <tr key={i} className="border-t border-steam-line/40"><td className="py-1 pr-2 text-steam-dim">{fmt(e.date)}</td><td className="pr-2">{E.EVIDENCE_LABEL[e.type]}</td><td className="pr-2 text-white">{e.label}</td><td className="font-mono text-[10px] text-steam-dim">{e.value}</td><td className={e.verifiable ? 'text-sky-300' : 'text-amber-300'}>{e.verifiable ? 'independently dated' : 'self-reported date'}</td></tr>
+          ))}</tbody></table>
+        </div>
+      )}
+
+      {claims.map(c => { const bar = E.claimBar(c, world, settings); return (
+        <div key={c.id} className="rounded border border-orange-400/30 bg-orange-950/20 p-3 text-sm">
+          <h4 className="mb-1 text-xs font-bold uppercase tracking-widest text-orange-300">Idea claim {c.id} · {c.claimant} · {c.claimantProject}</h4>
+          <p className="text-xs">{c.concept}</p>
+          <p className="mt-1 text-xs">Source: <MockLink href={c.sourceLink} className="text-steam-accent">{c.sourceLink}</MockLink> dated {fmt(c.sourceDate)}</p>
+          <ul className="mt-1 text-xs">{c.overlaps.map((o, i) => <li key={i}>{o.kind === 'distinctive' ? '◆' : '○'} {o.text} <span className="text-steam-dim">({o.kind})</span></li>)}</ul>
+          <ul className="mt-2 text-xs">{bar.checks.map((k, i) => <li key={i}>{k.ok ? '✓' : '✗'} {k.label}</li>)}</ul>
+        </div>
+      ); })}
+
+      {quoted.length > 0 && (
+        <div>
+          <h4 className="mb-1 text-xs font-bold uppercase tracking-widest text-steam-dim">Reviews flagged by the copy-signal detector (quoted, unverified)</h4>
+          {quoted.map((q, i) => <blockquote key={i} className="mb-1 border-l-2 border-amber-500/50 pl-2 text-xs"><span className="text-steam-dim">on {q.on} · {q.author}:</span> “{q.text}”</blockquote>)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SideBySide({ parties, date }) {
+  const dates = [...new Set(parties.flatMap(p => p.events.map(e => e.date)))].filter(d => d && d <= date).sort();
+  const cls = { public: 'text-sky-200', self: 'text-amber-200', system: 'text-steam-dim' };
+  return (
+    <div className="overflow-x-auto rounded bg-black/20">
+      <table className="w-full text-xs">
+        <thead><tr><th className="w-24 p-1.5 text-left text-steam-dim">Date</th>{parties.map(p => <th key={p.key} className="p-1.5 text-left" style={{ color: p.color }}>{p.name}</th>)}</tr></thead>
+        <tbody>{dates.map(d => (
+          <tr key={d} className="border-t border-steam-line/40">
+            <td className="whitespace-nowrap p-1.5 text-steam-dim">{fmt(d)}</td>
+            {parties.map(p => <td key={p.key} className="p-1.5 align-top">{p.events.filter(e => e.date === d).map((e, i) => <div key={i} className={cls[e.kind]}>{e.text}</div>)}</td>)}
+          </tr>
+        ))}</tbody>
+      </table>
+    </div>
+  );
+}
+function MiniChecks({ checks }) {
+  return (
+    <table className="w-full text-xs"><tbody>{Object.values(checks).map(c => (
+      <tr key={c.label} className="border-t border-steam-line/40"><td className="py-0.5 pr-1">{c.ok ? <span className="text-emerald-400">✓</span> : <span className="text-amber-400">✗</span>}</td><td className="pr-2 text-steam-dim">{c.label}</td><td className="text-right">{String(c.value)}</td></tr>
+    ))}</tbody></table>
+  );
+}
+
+function HeldList({ list, results, go, act, ...rest }) {
+  if (!list.length) return <Empty>No held records.</Empty>;
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-steam-dim">Held records are hidden and silent. Nobody is waiting on them, so they need no action. You can open one, or clear its signals to let the normal rules list it.</p>
+      {list.map(g => <HeldRow key={g.id} g={g} r={results[g.id]} results={results} go={go} act={act} {...rest} />)}
+    </div>
+  );
+}
+function HeldRow(props) {
+  const { g, r, go, act } = props;
+  const [open, setOpen] = useState(false);
+  const [note, setNote] = useState('');
+  return (
+    <div className="rounded bg-steam-panel ring-1 ring-black/40">
+      <RowHead g={g} r={r} go={go} onToggle={() => setOpen(!open)} right={<StatusPill s="HELD" />} />
+      {open && (
+        <div className="space-y-3 border-t border-steam-line p-4">
+          <EvidenceSummary {...props} />
+          <div className="flex gap-2"><input className="flex-1 text-sm" placeholder="Note (internal)" value={note} onChange={e => setNote(e.target.value)} /><Btn kind="warn" onClick={() => act('held:' + g.id, 'clear', { note })}>Clear signals</Btn></div>
+        </div>
+      )}
+    </div>
+  );
+}
+function NyeList({ list, results, go }) {
+  if (!list.length) return <Empty>No records waiting on age or reviews.</Empty>;
+  return <div className="space-y-2"><p className="text-xs text-steam-dim">Re-checked automatically every day. Nothing for moderators to do.</p>{list.map(g => <div key={g.id} className="rounded bg-steam-panel ring-1 ring-black/40"><RowHead g={g} r={results[g.id]} go={go} right={<StatusPill s="NOT_YET_ELIGIBLE" />} /></div>)}</div>;
+}
+function RejectedList({ list, results, go, date, setSession }) {
+  const [appealFor, setAppealFor] = useState(null);
+  const [text, setText] = useState('');
+  if (!list.length) return <Empty>No rejected records.</Empty>;
+  const fileAppeal = g => {
+    const ev = text.split('\n').map(x => x.trim()).filter(Boolean);
+    setSession(s => ({ ...s, appeals: [...s.appeals, { id: 'ap-s' + Math.random().toString(36).slice(2, 6), gameId: g.id, filed: date, statement: 'Filed from the moderation panel (simulated developer).', newEvidence: ev, session: true }] }));
+    setAppealFor(null); setText('');
+  };
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-steam-dim">Internal reasons are never shown publicly. Moderator rejections can be appealed. Automatic, non-accusatory rejections (removed, not a game, duplicate) are listed for completeness.</p>
+      {list.map(g => { const r = results[g.id]; return (
+        <div key={g.id} className="rounded bg-steam-panel ring-1 ring-black/40">
+          <RowHead g={g} r={r} go={go} right={<StatusPill s="REJECTED" />} />
+          <div className="border-t border-steam-line px-3 py-2 text-xs">
+            {r.internalReason && <div><span className="text-rose-300">Internal reason:</span> {r.internalReason}</div>}
+            {r.notes.map((n, i) => <div key={i} className="text-steam-dim">{n}</div>)}
+            {appealFor === g.id ? (
+              <div className="mt-2 space-y-2">
+                <textarea rows={2} className="w-full" placeholder="New evidence, one item per line (leave empty to test an appeal without new evidence)" value={text} onChange={e => setText(e.target.value)} />
+                <div className="flex gap-2"><Btn kind="blue" onClick={() => fileAppeal(g)}>File appeal as developer</Btn><Btn onClick={() => setAppealFor(null)}>Cancel</Btn></div>
+              </div>
+            ) : <button className="mt-1 text-steam-accent hover:underline" onClick={() => setAppealFor(g.id)}>Simulate a developer appeal…</button>}
+          </div>
+        </div>
+      ); })}
+    </div>
+  );
+}
+function AppealsList({ appeals, world, results, date, go }) {
+  if (!appeals.length) return <Empty>No appeals yet.</Empty>;
+  const idx = E.decisionIndex(world, date);
+  return (
+    <div className="space-y-2">{appeals.map(a => {
+      const g = world.byId[a.gameId], d = E.finalDecision(idx, 'appeal:' + a.id);
+      const state = d ? (d.action === 'approve' ? 'accepted' : 'denied') : results[g.id].triggers.some(t => t.id === 'appeal:' + a.id) ? 'in queue' : 'closed (no new evidence)';
+      return (
+        <div key={a.id} className="rounded bg-steam-panel p-3 text-sm ring-1 ring-black/40">
+          <div className="flex flex-wrap items-center gap-2"><b className="text-white">{g.title}</b><span className="text-xs text-steam-dim">filed {fmt(a.filed)}</span><span className="rounded bg-black/40 px-1.5 text-xs">{state}</span><StatusPill s={results[g.id].status} /><button className="ml-auto text-xs text-steam-accent" onClick={() => go('game', { id: g.id, internal: true })}>preview</button></div>
+          <p className="mt-1 text-xs">{a.statement}</p>
+          <ul className="mt-1 list-disc pl-5 text-xs text-steam-dim">{a.newEvidence.length ? a.newEvidence.map((e, i) => <li key={i}>{e}</li>) : <li>No new evidence</li>}</ul>
+        </div>
+      );
+    })}</div>
+  );
+}
+function ClaimsList({ claims, world, results, date, settings, go }) {
+  const idx = E.decisionIndex(world, date);
+  if (!claims.length) return <Empty>No claims yet.</Empty>;
+  return (
+    <div className="space-y-2">{claims.map(c => {
+      const bar = E.claimBar(c, world, settings), d = E.finalDecision(idx, 'claim:' + c.id), t = world.byId[c.targetId];
+      const state = d ? (d.action === 'approve' ? 'upheld — timeline published' : 'dismissed') : bar.ok ? 'meets bar — in queue' : 'below evidence bar — no effect';
+      return (
+        <div key={c.id} className="rounded bg-steam-panel p-3 text-sm ring-1 ring-black/40">
+          <div className="flex flex-wrap items-center gap-2"><b className="text-white">{c.claimant}</b><span className="text-steam-dim">→</span><b className="text-white">{t.title}</b><StatusPill s={results[t.id].status} /><span className="text-xs text-steam-dim">filed {fmt(c.filed)}</span><span className={`rounded px-1.5 text-xs ${bar.ok ? 'bg-emerald-900/50' : 'bg-black/40'}`}>{state}</span></div>
+          <ul className="mt-1 text-xs">{bar.checks.map((k, i) => <li key={i}>{k.ok ? '✓' : '✗'} {k.label}</li>)}</ul>
+        </div>
+      );
+    })}</div>
+  );
+}
+function LogList({ world, date }) {
+  const entries = world.log.filter(e => e.date <= date).slice().reverse();
+  return (
+    <table className="w-full text-xs"><thead className="text-steam-dim"><tr><th className="text-left">Date</th><th className="text-left">Trigger</th><th className="text-left">Action</th><th className="text-left">By</th><th className="text-left">Note / internal reason</th></tr></thead>
+      <tbody>{entries.map((e, i) => (
+        <tr key={i} className="border-t border-steam-line/40"><td className="py-1 pr-2">{fmt(e.date)}</td><td className="pr-2 font-mono">{e.triggerId}</td><td className="pr-2">{e.action}</td><td className="pr-2">{e.by}{e.scripted ? '' : ' ★'}</td><td>{e.internalReason || e.note}</td></tr>
+      ))}</tbody></table>
+  );
+}
+
+// ---------- 6. Settings ----------
+const SETTING_DEFS = [
+  ['Eligibility', [
+    ['MIN_DAYS_RELEASED', 'Minimum days since release', 'number', 0, 365, 1],
+    ['MIN_REVIEWS', 'Minimum review count', 'number', 0, 2000, 1],
+  ]],
+  ['Signals', [
+    ['COPY_SIGNAL_THRESHOLD', 'Review copy-signal threshold (HELD at or above)', 'range', 0, 1, 0.01],
+    ['SIMILARITY_THRESHOLD', 'Similarity collision threshold', 'range', 0, 1, 0.01],
+    ['NAMED_AS_ORIGINAL_CHECK', 'Block auto-listing when a game is named as the original on another game’s page', 'bool'],
+    ['CLAIM_REQUIRES_DISTINCTIVE_OVERLAP', 'Claims must name a specific, distinctive overlap', 'bool'],
+  ]],
+  ['Queue priority', [
+    ['PRIORITY_ASSET_MATCH', 'Asset/code match vs registered build', 'number', 0, 200, 1],
+    ['PRIORITY_PRERELEASE_REGISTRATION', 'Pre-release registration', 'number', 0, 200, 1],
+    ['PRIORITY_CLAIM', 'Idea claim meeting the bar', 'number', 0, 200, 1],
+    ['PRIORITY_APPEAL', 'Appeal', 'number', 0, 200, 1],
+    ['PRIORITY_REGISTRATION', 'Registration of a released game', 'number', 0, 200, 1],
+    ['PRIORITY_BOOST_LIVE_LOOKALIKE', 'Boost: similar game already live on Steam', 'number', 0, 50, 1],
+  ]],
+  ['Moderation', [
+    ['WEEKLY_CAPACITY', 'Weekly decision capacity', 'number', 1, 500, 1],
+    ['RESPONSE_WINDOW_DAYS', 'Right-of-response window (days)', 'number', 1, 60, 1],
+  ]],
+];
+function SettingsPanel({ settings, setSettings, tests, go }) {
+  const set = (k, v) => setSettings({ ...settings, [k]: v });
+  const fails = tests.filter(t => !t.pass && !t.overridden).length, worst = tests.filter(t => t.worst).length;
+  return (
+    <div className="mx-auto max-w-3xl space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h1 className="text-2xl font-bold text-white">Rules engine settings</h1>
+        <div className="flex items-center gap-2 text-sm">
+          <span className={worst ? 'text-rose-300' : fails ? 'text-amber-300' : 'text-emerald-300'}>{worst ? `${worst} worst-case` : ''} {fails} failing / {tests.length} tests</span>
+          <Btn onClick={() => go('tests')}>Open tests</Btn>
+          <Btn onClick={() => setSettings({ ...M.settings })}>Reset defaults</Btn>
+        </div>
+      </div>
+      <p className="text-sm text-steam-dim">Every change re-runs the engine on every record immediately. Changed values are highlighted.</p>
+      {SETTING_DEFS.map(([group, defs]) => (
+        <Section key={group} title={group}>
+          <div className="space-y-3">{defs.map(([k, label, type, min, max, step]) => {
+            const changed = settings[k] !== M.settings[k];
+            return (
+              <div key={k} className={`grid items-center gap-2 sm:grid-cols-[1fr_260px] ${changed ? 'rounded bg-amber-900/20 px-2 py-1' : ''}`}>
+                <div><div className="text-sm text-white">{label}</div><div className="font-mono text-[10px] text-steam-dim">{k} · default {String(M.settings[k])}</div></div>
+                {type === 'bool' ? <input type="checkbox" checked={settings[k]} onChange={e => set(k, e.target.checked)} className="justify-self-start" />
+                  : type === 'range' ? <div className="flex items-center gap-2"><input type="range" min={min} max={max} step={step} value={settings[k]} onChange={e => set(k, +e.target.value)} className="flex-1" /><input type="number" min={min} max={max} step={step} value={settings[k]} onChange={e => set(k, +e.target.value)} className="w-20" /></div>
+                  : <input type="number" min={min} max={max} step={step} value={settings[k]} onChange={e => set(k, +e.target.value)} className="w-28" />}
+              </div>
+            );
+          })}</div>
+        </Section>
+      ))}
+    </div>
+  );
+}
+
+// ---------- 8. Tests ----------
+function TestsPanel({ tests, world, date, settings, delta, go }) {
+  const [sweep, setSweep] = useState(null);
+  const claimTests = E.claimTests(world, settings);
+  const fails = tests.filter(t => !t.pass && !t.overridden), worst = tests.filter(t => t.worst);
+  const runSweep = () => { const t0 = performance.now(); const runs = E.sweep(world, settings); setSweep({ runs, ms: performance.now() - t0, settings: JSON.stringify(settings) }); };
+  const stale = sweep && sweep.settings !== JSON.stringify(settings);
+  const TRUTH = { original: 'original', 'non-original': 'non-original', parallel: 'parallel dev', 'idea-overlap': 'idea overlap', 'n/a': 'n/a', unknown: 'unknown' };
+  const flips = Object.entries(delta.tests || {});
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-bold text-white">Test cases at {fmt(date)}</h1>
+          <p className="text-sm text-steam-dim">Expected status comes from the scripted timeline in MOCK_DATA. Worst case = a non-original record ends up LISTED or VERIFIED.</p>
+        </div>
+        <div className="flex gap-3 text-sm">
+          <span className="rounded bg-emerald-900/40 px-2 py-1">{tests.filter(t => t.pass).length} pass</span>
+          <span className={`rounded px-2 py-1 ${fails.length ? 'bg-amber-700/60 text-white' : 'bg-black/30'}`}>{fails.length} fail</span>
+          <span className={`rounded px-2 py-1 ${worst.length ? 'bg-rose-600 text-white' : 'bg-black/30'}`}>{worst.length} worst-case</span>
+        </div>
+      </div>
+      {flips.length > 0 && (
+        <div className="rounded border border-amber-500/40 bg-amber-950/30 p-2 text-sm">
+          After the last {delta.cause}: {flips.map(([id, k]) => <span key={id} className={`mr-3 ${k === 'broke' ? 'text-amber-300' : 'text-emerald-300'}`}>{world.byId[id].title} {k === 'broke' ? 'now FAILS' : 'now passes'}</span>)}
+        </div>
+      )}
+      <div className="overflow-x-auto rounded bg-steam-panel ring-1 ring-black/40">
+        <table className="w-full text-xs">
+          <thead className="bg-black/30 text-steam-dim"><tr><th className="p-2 text-left">Case</th><th className="p-2 text-left">Record</th><th className="p-2 text-left">Truth</th><th className="p-2">Expected</th><th className="p-2">Actual</th><th className="p-2">Result</th><th className="p-2 text-left">Engine reasons</th></tr></thead>
+          <tbody>{tests.map(t => {
+            const flip = delta.tests && delta.tests[t.id];
+            const rowCls = t.worst ? 'bg-rose-900/50' : t.overridden ? 'opacity-60' : !t.pass ? 'bg-amber-900/30' : '';
+            return (
+              <tr key={t.id + (flip ? delta.at : '')} className={`border-t border-steam-line/40 ${rowCls} ${flip === 'broke' ? 'flash' : ''}`}>
+                <td className="p-2 font-mono">{t.case}</td>
+                <td className="p-2"><button className="font-semibold text-white hover:text-steam-accent" onClick={() => go('game', { id: t.id, internal: true })}>{t.title}</button><div className="text-steam-dim">{t.scenario}</div></td>
+                <td className="p-2">{TRUTH[t.truth]}</td>
+                <td className="p-2 text-center"><StatusPill s={t.expected} /></td>
+                <td className="p-2 text-center"><StatusPill s={t.actual} /></td>
+                <td className="p-2 text-center font-bold">
+                  {t.worst ? <span className="text-rose-300">WORST CASE</span> : t.overridden ? <span className="font-normal text-steam-dim">overridden by session action</span> : t.pass ? <span className="text-emerald-400">PASS</span> : <span className="text-amber-300">FAIL</span>}
+                </td>
+                <td className="p-2 text-steam-dim">{t.reasons.join(' · ')}</td>
+              </tr>
+            );
+          })}</tbody>
+        </table>
+      </div>
+
+      <Section title="Claim evidence-bar tests">
+        <table className="w-full text-xs"><tbody>{claimTests.map(t => (
+          <tr key={t.id} className="border-t border-steam-line/40"><td className="py-1 font-mono">{t.case}</td><td>{t.claimant} → {t.target}</td><td>expected {t.expected ? 'meets bar' : 'below bar'}</td><td>actual {t.actual ? 'meets bar' : 'below bar'}</td><td className={t.pass ? 'text-emerald-400' : 'text-amber-300'}>{t.pass ? 'PASS' : 'FAIL'}</td></tr>
+        ))}</tbody></table>
+      </Section>
+
+      <Section title="Whole-timeline sweep" right={<Btn kind="blue" onClick={runSweep}>Run every day {fmt(M.simulation.start)} → {fmt(M.simulation.end)}</Btn>}>
+        {!sweep ? <p className="text-sm text-steam-dim">Runs the engine for every simulated day with the current settings and lists every failing or worst-case window.</p> : (
+          <div>
+            <p className={`mb-2 text-xs ${stale ? 'text-amber-300' : 'text-steam-dim'}`}>{stale ? 'Settings changed since this sweep. Run it again. ' : ''}{sweep.runs.length} problem windows · {sweep.ms.toFixed(0)} ms</p>
+            {sweep.runs.length === 0 ? <p className="text-sm text-emerald-300">Every test passes on every day.</p> : (
+              <table className="w-full text-xs"><tbody>{sweep.runs.map((w, i) => (
+                <tr key={i} className={`border-t border-steam-line/40 ${w.worst ? 'bg-rose-900/40' : ''}`}>
+                  <td className="py-1 pr-2 font-mono">{w.case}</td><td className="pr-2 text-white">{w.title}</td><td className="pr-2">{fmt(w.from)} → {fmt(w.to)}</td>
+                  <td className="pr-2">expected <StatusPill s={w.expected} /> actual <StatusPill s={w.actual} /></td>
+                  <td className="font-bold">{w.worst ? <span className="text-rose-300">WORST CASE</span> : <span className="text-amber-300">FAIL</span>}</td>
+                </tr>
+              ))}</tbody></table>
+            )}
+          </div>
+        )}
+      </Section>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
